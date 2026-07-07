@@ -13,11 +13,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Terminal UI for viewing VACC Slurm jobs and cluster status.",
     )
     parser.add_argument(
-        "--user",
+        "-u", "--user",
         help="Slurm username to inspect. Defaults to the current VACC shell user.",
     )
     parser.add_argument(
-        "--refresh",
+        "-r", "--refresh",
         type=float,
         default=2.0,
         help="Auto-refresh interval in seconds. Use 0 to disable. Default: 2.0.",
