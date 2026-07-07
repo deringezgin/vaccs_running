@@ -253,11 +253,11 @@ class NodeFilterTests(unittest.TestCase):
 
         app._draw_header(screen, 100)
 
-        self.assertIn((1, 2, " r Running ", curses.A_BOLD), screen.writes)
-        self.assertIn((1, 14, " n Nodes ", 0), screen.writes)
+        self.assertIn((1, 2, " j Jobs ", curses.A_BOLD), screen.writes)
+        self.assertIn((1, 11, " n Nodes ", 0), screen.writes)
         written = " ".join(write[2] for write in screen.writes)
         self.assertIn(" h History ", written)
-        self.assertNotIn(" j Jobs ", written)
+        self.assertNotIn(" r Running ", written)
 
     def test_header_does_not_show_refresh_interval(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0.25)
@@ -712,7 +712,7 @@ class NodeFilterTests(unittest.TestCase):
         self.assertIn("[", written)
         self.assertIn("]", written)
 
-    def test_r_and_n_switch_main_views(self):
+    def test_j_and_n_switch_main_views(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
 
         self.assertEqual(app.state.view, "jobs")
@@ -721,10 +721,13 @@ class NodeFilterTests(unittest.TestCase):
         self.assertEqual(app.state.view, "nodes")
 
         self.assertTrue(app._handle_key(None, ord("j")))
+        self.assertEqual(app.state.view, "jobs")
+
+        self.assertTrue(app._handle_key(None, ord("n")))
         self.assertEqual(app.state.view, "nodes")
 
         self.assertTrue(app._handle_key(None, ord("r")))
-        self.assertEqual(app.state.view, "jobs")
+        self.assertEqual(app.state.view, "nodes")
 
     def test_h_switches_to_history_and_unused_key_keeps_view(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)

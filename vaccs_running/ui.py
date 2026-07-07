@@ -323,7 +323,7 @@ class VaccsRunningApp:
             self._switch_view("nodes")
         elif key == ord("h"):
             self._switch_view("history")
-        elif key == ord("r"):
+        elif key == ord("j"):
             self._switch_view("jobs")
         elif key == ord("g"):
             if self.state.view == "nodes":
@@ -513,7 +513,7 @@ class VaccsRunningApp:
 
         x = 2
         for view, label in [
-            ("jobs", " r Running "),
+            ("jobs", " j Jobs "),
             ("nodes", " n Nodes "),
             ("history", " h History "),
         ]:
