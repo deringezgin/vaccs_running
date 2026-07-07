@@ -173,6 +173,28 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertEqual([job.job_id for job in jobs], ["1"])
         self.assertEqual(jobs[0].group, "pi-example")
 
+    def test_group_prefilter_still_passes_state_filter(self):
+        client = SlurmClient(user="testuser", states="PD")
+        client.set_job_principal_filters(groups={"pi-example"})
+        fake_runner = FakeRunner()
+        client.runner = fake_runner
+
+        self.assertEqual(client.fetch_jobs(), [])
+
+        self.assertNotIn("-u", fake_runner.calls[0][0])
+        self.assertEqual(
+            fake_runner.calls[0][0],
+            [
+                "squeue",
+                "--array",
+                "-h",
+                "-t",
+                "PD",
+                "-o",
+                SQUEUE_FORMAT,
+            ],
+        )
+
     def test_group_filter_takes_priority_over_selected_users(self):
         client = SlurmClient(user="testuser")
         client.set_job_principal_filters(

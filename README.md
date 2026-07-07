@@ -40,6 +40,8 @@ To prefilter the Jobs view by Slurm state, pass the state list through to
 ./vaccs-running --state PD
 ./vaccs-running --states RUNNING,PENDING
 ./vaccs-running --user all --state PD
+./vaccs-running --group pi-example
+./vaccs-running -g pi-example --state RUNNING
 ```
 
 Inside the Running view, press `s` to see the selected job's sbatch script.

@@ -32,6 +32,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "-g", "--group",
+        help="Slurm group/account to inspect in the jobs view.",
+    )
+    parser.add_argument(
         "-r", "--refresh",
         type=float,
         default=2.0,
@@ -57,19 +61,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def make_client(user: str | None, states: str) -> SlurmClient:
+def make_client(user: str | None, states: str, group: str | None = None) -> SlurmClient:
     client = SlurmClient(
         user=None if is_all_user_selector(user) else user,
         states=states,
     )
-    if is_all_user_selector(user):
+    group = group.strip() if group else None
+    if group:
+        users = set()
+        if user and not is_all_user_selector(user):
+            users.add(user.strip())
+        client.set_job_principal_filters(users=users, groups={group})
+    elif is_all_user_selector(user):
         client.set_job_user_filter(user)
     return client
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    client = make_client(args.user, args.states)
+    client = make_client(args.user, args.states, args.group)
 
     try:
         VaccsRunningApp(
