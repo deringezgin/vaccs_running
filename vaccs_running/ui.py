@@ -15,10 +15,10 @@ from .slurm import (
     Node,
     SlurmClient,
     SlurmError,
+    VACC_PARTITIONS,
     group_job_records,
     plural_label,
     record_from_job,
-    state_base,
     summarize_job_records,
     summarize_jobs,
     summarize_nodes,
@@ -55,6 +55,8 @@ SURFACE_PAIR = 14
 MIN_TERMINAL_WIDTH = 70
 MIN_TERMINAL_HEIGHT = 16
 HISTORY_REFRESH_SECONDS = 10.0
+BUSY_JOBS_REFRESH_SECONDS = 5.0
+BUSY_JOBS_REFRESH_THRESHOLD = 50
 HISTORY_FILTER_OPTIONS = [
     ("1h", "last 1 hour"),
     ("3h", "last 3 hours"),
@@ -130,8 +132,15 @@ class VaccsRunningApp:
         curses.wrapper(self._main)
 
     def _active_refresh_seconds(self) -> float:
+        if not self.refresh_seconds:
+            return self.refresh_seconds
         if self.state.view == "history" and self.refresh_seconds:
             return HISTORY_REFRESH_SECONDS
+        if (
+            self.state.view == "jobs"
+            and len(self.state.jobs) > BUSY_JOBS_REFRESH_THRESHOLD
+        ):
+            return max(self.refresh_seconds, BUSY_JOBS_REFRESH_SECONDS)
         return self.refresh_seconds
 
     def _main(self, stdscr: curses.window) -> None:
@@ -273,8 +282,18 @@ class VaccsRunningApp:
         active = getattr(self.client, "job_user_filter_active", None)
         return bool(active) if active is not None else False
 
+    def _job_partition_filter_active(self) -> bool:
+        active = getattr(self.client, "job_partition_filter_active", None)
+        if active is not None:
+            return bool(active)
+        return bool(self._selected_job_partitions())
+
     def _jobs_filter_active(self) -> bool:
-        return self._squeue_state_filter_active() or self._job_user_filter_active()
+        return (
+            self._squeue_state_filter_active()
+            or self._job_user_filter_active()
+            or self._job_partition_filter_active()
+        )
 
     def _show_job_principal_columns(self) -> bool:
         return (
@@ -358,9 +377,6 @@ class VaccsRunningApp:
         elif key == ord("d"):
             if self.state.view in {"jobs", "nodes"}:
                 self._show_detail(stdscr)
-        elif key == ord("s"):
-            if self.state.view == "jobs":
-                self._show_job_script(stdscr)
         elif key == ord("p"):
             if self.state.view == "nodes":
                 self._show_node_jobs(stdscr)
@@ -605,10 +621,12 @@ class VaccsRunningApp:
                     group_text = f" group: {group_summary} "
                     self._addstr(stdscr, 3, x, group_text, self._pair(ACTIVE_TAB_PAIR))
                     x += len(group_text) + 1
+            if self._job_partition_filter_active():
+                partition_text = f" partition: {self._job_partition_summary()} "
+                self._addstr(stdscr, 3, x, partition_text, self._pair(ACTIVE_TAB_PAIR))
+                x += len(partition_text) + 1
             self._addstr(stdscr, 3, x, " d detail ", self._pair(MUTED_PAIR))
             x += len(" d detail ") + 1
-            self._addstr(stdscr, 3, x, " s script ", self._pair(MUTED_PAIR))
-            x += len(" s script ") + 1
             self._addstr(stdscr, 3, x, " q quit", self._pair(MUTED_PAIR))
 
     def _draw_jobs_table(
@@ -1238,45 +1256,6 @@ class VaccsRunningApp:
             close_keys=(ord("d"),),
         )
 
-    def _show_job_script(self, stdscr: curses.window) -> None:
-        job_id = self._selected_job_script_id()
-        if not job_id:
-            return
-        self._popup_command(
-            stdscr,
-            f"scontrol write batch_script {job_id} -",
-            self.client.show_job_script,
-            job_id,
-            close_keys=(ord("s"),),
-        )
-
-    def _selected_job_script_id(self) -> str | None:
-        job = self._selected_job()
-        if job:
-            return job.array_parent
-
-        group = self._selected_job_group()
-        if not group:
-            return None
-
-        matching_jobs = [
-            job
-            for job in self.state.jobs
-            if job.array_parent == group.array_parent and job.name == group.name
-        ]
-        if matching_jobs:
-            return sorted(matching_jobs, key=job_script_target_sort_key)[0].array_parent
-
-        matching_records = [
-            record
-            for record in self.state.job_records
-            if record.array_parent == group.array_parent and record.name == group.name
-        ]
-        if matching_records:
-            return sorted(matching_records, key=record_script_target_sort_key)[0].array_parent
-
-        return group.array_parent
-
     def _show_node_jobs(self, stdscr: curses.window) -> None:
         node = self._selected_node()
         if not node:
@@ -1315,11 +1294,11 @@ class VaccsRunningApp:
     def _fetch_job_filter_choices(self) -> JobFilterChoices:
         fetch = getattr(self.client, "fetch_running_filter_choices", None)
         if not fetch:
-            return JobFilterChoices(users=[], groups=[])
+            return JobFilterChoices(users=[], groups=[], partitions=list(VACC_PARTITIONS))
         try:
             return fetch()
         except SlurmError:
-            return JobFilterChoices(users=[], groups=[])
+            return JobFilterChoices(users=[], groups=[], partitions=list(VACC_PARTITIONS))
 
     def _run_jobs_filter_menu(
         self,
@@ -1413,11 +1392,12 @@ class VaccsRunningApp:
                 activate_fn(win, box_height, box_width, items[selected])
             elif key == ord("c"):
                 self._clear_job_filters()
-            elif key in (ord("s"), ord("u"), ord("g")):
+            elif key in (ord("s"), ord("u"), ord("g"), ord("p")):
                 shortcut_actions = {
                     ord("s"): ("status",),
                     ord("u"): ("custom_user", "user"),
                     ord("g"): ("custom_group", "group"),
+                    ord("p"): ("custom_partition", "partition"),
                 }
                 for action in shortcut_actions[key]:
                     match = next(
@@ -1460,6 +1440,11 @@ class VaccsRunningApp:
                 "action": "group",
                 "label": f"Filter by group: {self._job_group_summary()}",
             },
+            {
+                "kind": "submenu",
+                "action": "partition",
+                "label": f"Filter by partition: {self._job_partition_summary()}",
+            },
         ]
 
     def _activate_jobs_filter_home_item(
@@ -1475,6 +1460,8 @@ class VaccsRunningApp:
             self._show_jobs_user_filter(stdscr, choices)
         elif action == "group":
             self._show_jobs_group_filter(stdscr, choices)
+        elif action == "partition":
+            self._show_jobs_partition_filter(stdscr, choices)
 
     def _show_jobs_status_filter(self, stdscr: curses.window) -> None:
         self._run_jobs_filter_menu(
@@ -1516,6 +1503,26 @@ class VaccsRunningApp:
             "filter by group",
             lambda: self._jobs_group_filter_items(choices),
             lambda win, height, width, item: self._activate_jobs_group_filter_item(
+                win,
+                height,
+                width,
+                choices,
+                item,
+            ),
+            " enter/click select  c clear  q back ",
+            close_keys=(ord("f"),),
+        )
+
+    def _show_jobs_partition_filter(
+        self,
+        stdscr: curses.window,
+        choices: JobFilterChoices,
+    ) -> None:
+        self._run_jobs_filter_menu(
+            stdscr,
+            "filter by partition",
+            lambda: self._jobs_partition_filter_items(choices),
+            lambda win, height, width, item: self._activate_jobs_partition_filter_item(
                 win,
                 height,
                 width,
@@ -1602,6 +1609,44 @@ class VaccsRunningApp:
                     "value": group,
                     "label": group,
                     "checked": group in selected_groups,
+                }
+            )
+        return items
+
+    def _jobs_partition_filter_items(
+        self,
+        choices: JobFilterChoices,
+    ) -> list[dict[str, object]]:
+        selected_partitions = self._selected_job_partitions()
+        items: list[dict[str, object]] = [
+            {
+                "kind": "action",
+                "action": "partitions_all",
+                "label": "Select all",
+                "checked": (
+                    bool(choices.partitions)
+                    and selected_partitions == set(choices.partitions)
+                ),
+            },
+            {
+                "kind": "action",
+                "action": "partitions_clear",
+                "label": "Clear all",
+                "checked": not selected_partitions,
+            },
+            {
+                "kind": "action",
+                "action": "custom_partition",
+                "label": "Enter partition name...",
+            },
+        ]
+        for partition in choices.partitions:
+            items.append(
+                {
+                    "kind": "partition",
+                    "value": partition,
+                    "label": partition,
+                    "checked": partition in selected_partitions,
                 }
             )
         return items
@@ -1704,6 +1749,43 @@ class VaccsRunningApp:
                 self._set_job_principal_filters(set(), {value})
         self._refresh_jobs_after_filter_change()
 
+    def _activate_jobs_partition_filter_item(
+        self,
+        win: curses.window,
+        box_height: int,
+        box_width: int,
+        choices: JobFilterChoices,
+        item: dict[str, object],
+    ) -> None:
+        kind = item["kind"]
+        action = item.get("action")
+        if kind == "partition":
+            partitions = self._selected_job_partitions()
+            value = str(item["value"])
+            if value in partitions:
+                partitions.remove(value)
+            else:
+                partitions.add(value)
+            self._set_job_partition_filters(partitions)
+        elif action == "partitions_all":
+            self._set_job_partition_filters(set(choices.partitions))
+        elif action == "partitions_clear":
+            self._set_job_partition_filters(set())
+        elif action == "custom_partition":
+            value = self._read_jobs_filter_choice(
+                win,
+                box_height,
+                box_width,
+                "partition",
+                choices.partitions,
+            )
+            if value:
+                if value not in choices.partitions:
+                    choices.partitions.append(value)
+                    choices.partitions.sort()
+                self._set_job_partition_filters({value})
+        self._refresh_jobs_after_filter_change()
+
     def _clear_job_filters(self) -> None:
         clear = getattr(self.client, "clear_job_filters", None)
         if clear:
@@ -1740,6 +1822,13 @@ class VaccsRunningApp:
         if setter:
             setter(users, groups, all_principals=all_principals)
 
+    def _set_job_partition_filters(self, partitions: set[str]) -> None:
+        setter = getattr(self.client, "set_job_partition_filters", None)
+        if setter:
+            setter(partitions)
+        else:
+            setattr(self.client, "job_partitions", set(partitions))
+
     def _selected_job_state_codes(self) -> set[str]:
         states = self._squeue_state_filter()
         if states.lower() == "all":
@@ -1762,6 +1851,9 @@ class VaccsRunningApp:
     def _selected_job_groups(self) -> set[str]:
         return set(getattr(self.client, "job_groups", set()) or set())
 
+    def _selected_job_partitions(self) -> set[str]:
+        return set(getattr(self.client, "job_partitions", set()) or set())
+
     def _job_all_principals(self) -> bool:
         return bool(getattr(self.client, "job_all_principals", False))
 
@@ -1778,6 +1870,14 @@ class VaccsRunningApp:
         if not groups:
             return "none"
         return plural_label(len(groups), "group")
+
+    def _job_partition_summary(self) -> str:
+        partitions = self._selected_job_partitions()
+        if not partitions:
+            return "all"
+        if len(partitions) == 1:
+            return next(iter(partitions))
+        return plural_label(len(partitions), "partition")
 
     def _read_jobs_filter_choice(
         self,
@@ -1949,10 +2049,11 @@ class VaccsRunningApp:
         wrapped = wrap_lines(current_text, box_width - 4)
         while True:
             now = time.monotonic()
+            refresh_seconds = self._active_refresh_seconds()
             if (
                 refresh_while_open
-                and self.refresh_seconds
-                and now - last_refresh >= self.refresh_seconds
+                and refresh_seconds
+                and now - last_refresh >= refresh_seconds
             ):
                 self._refresh_current()
                 self._draw(stdscr)
@@ -1996,20 +2097,6 @@ def command_text(fn, job_id: str) -> str:
         return fn(job_id).strip() or "No output."
     except SlurmError as exc:
         return str(exc)
-
-
-SCRIPT_STATE_PRIORITY = {
-    "RUNNING": 0,
-    "PENDING": 1,
-}
-
-
-def job_script_target_sort_key(job: Job) -> tuple[int, str]:
-    return (SCRIPT_STATE_PRIORITY.get(state_base(job.state), 2), job.job_id)
-
-
-def record_script_target_sort_key(record: JobRecord) -> tuple[int, str]:
-    return (SCRIPT_STATE_PRIORITY.get(record.base_state, 2), record.job_id)
 
 
 def filter_choice_options(options: list[str], query: str) -> list[str]:

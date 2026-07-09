@@ -6,6 +6,7 @@ from vaccs_running.slurm import (
     NODE_JOBS_FORMAT,
     SQUEUE_FORMAT,
     SlurmClient,
+    VACC_PARTITIONS,
     aggregate_user_usage,
     format_node_jobs,
     format_user_usage,
@@ -195,6 +196,31 @@ class SlurmParsingTests(unittest.TestCase):
             ],
         )
 
+    def test_partition_prefilter_passes_partition_filter_to_squeue(self):
+        client = SlurmClient(user="testuser")
+        client.set_job_partition_filters({"nvgpu", "gpu-preempt"})
+        fake_runner = FakeRunner()
+        client.runner = fake_runner
+
+        self.assertEqual(client.fetch_jobs(), [])
+
+        self.assertEqual(
+            fake_runner.calls[0][0],
+            [
+                "squeue",
+                "--array",
+                "-h",
+                "-u",
+                "testuser",
+                "-p",
+                "gpu-preempt,nvgpu",
+                "-t",
+                "all",
+                "-o",
+                SQUEUE_FORMAT,
+            ],
+        )
+
     def test_group_filter_takes_priority_over_selected_users(self):
         client = SlurmClient(user="testuser")
         client.set_job_principal_filters(
@@ -232,12 +258,13 @@ class SlurmParsingTests(unittest.TestCase):
             "testuser",
         )
 
-    def test_fetch_running_filter_choices_lists_running_users_and_groups(self):
+    def test_fetch_running_filter_choices_lists_users_groups_and_partitions(self):
         client = SlurmClient(user="testuser")
         fake_runner = FakeRunner(
-            "alice|pi-example\n"
-            "alice|pi-example\n"
-            "bob|pi-other\n"
+            "alice|pi-example|nvgpu\n"
+            "alice|pi-example|nvgpu\n"
+            "bob|pi-other|gpu-preempt\n"
+            "zoe|pi-custom|custom-partition\n"
         )
         client.runner = fake_runner
 
@@ -255,8 +282,10 @@ class SlurmParsingTests(unittest.TestCase):
                 FILTER_CHOICES_FORMAT,
             ],
         )
-        self.assertEqual(choices.users, ["alice", "bob"])
-        self.assertEqual(choices.groups, ["pi-example", "pi-other"])
+        self.assertEqual(choices.users, ["alice", "bob", "zoe"])
+        self.assertEqual(choices.groups, ["pi-custom", "pi-example", "pi-other"])
+        self.assertIn("custom-partition", choices.partitions)
+        self.assertEqual(set(VACC_PARTITIONS).difference(choices.partitions), set())
 
     def test_history_uses_unfiltered_squeue_snapshot(self):
         client = SlurmClient(user="testuser", states="PD")
@@ -669,19 +698,6 @@ NodeName=gpudebug01 Arch=x86_64 CoresPerSocket=64
         self.assertIn("USER", output)
         self.assertIn("testuser", output)
         self.assertIn("train", output)
-
-    def test_show_job_script_writes_batch_script_to_stdout(self):
-        client = SlurmClient(user="testuser")
-        fake_runner = FakeRunner("#!/bin/bash\n#SBATCH --job-name=train\n")
-        client.runner = fake_runner
-
-        output = client.show_job_script("4341591")
-
-        self.assertEqual(
-            fake_runner.calls[0][0],
-            ["scontrol", "write", "batch_script", "4341591", "-"],
-        )
-        self.assertEqual(output, "#!/bin/bash\n#SBATCH --job-name=train\n")
 
     def test_node_jobs_reports_empty_node(self):
         client = SlurmClient(user="testuser")

@@ -3,6 +3,7 @@ import unittest
 
 from vaccs_running.slurm import Job, JobFilterChoices, JobRecord, Node
 from vaccs_running.ui import (
+    BUSY_JOBS_REFRESH_SECONDS,
     HISTORY_REFRESH_SECONDS,
     VaccsRunningApp,
     command_text,
@@ -38,9 +39,6 @@ class FakeClient:
     def cluster_usage(self):
         return "usage by user"
 
-    def show_job_script(self, job_id):
-        return f"#!/bin/bash\n#SBATCH --job-name={job_id}\n"
-
 
 class StateFilteredClient(FakeClient):
     squeue_states = "PD"
@@ -53,6 +51,7 @@ class JobsFilterClient(FakeClient):
         self.squeue_states = "all"
         self.job_users = {"testuser"}
         self.job_groups = set()
+        self.job_partitions = set()
         self.job_all_principals = False
         self.refreshes = 0
 
@@ -67,6 +66,10 @@ class JobsFilterClient(FakeClient):
             or self.job_groups
             or self.job_users != {self.user}
         )
+
+    @property
+    def job_partition_filter_active(self):
+        return bool(self.job_partitions)
 
     @property
     def job_user_label(self):
@@ -97,9 +100,13 @@ class JobsFilterClient(FakeClient):
         if not self.job_all_principals and not self.job_users and not self.job_groups:
             self.job_users = {self.user}
 
+    def set_job_partition_filters(self, partitions=None):
+        self.job_partitions = set(partitions or [])
+
     def clear_job_filters(self):
         self.squeue_states = "all"
         self.set_job_principal_filters(users={self.user})
+        self.job_partitions = set()
 
     def fetch_active_job_records(self):
         self.refreshes += 1
@@ -109,6 +116,7 @@ class JobsFilterClient(FakeClient):
         return JobFilterChoices(
             users=["alice", "other", "testuser"],
             groups=["pi-example", "pi-other"],
+            partitions=["gpu-preempt", "nvgpu"],
         )
 
 
@@ -194,12 +202,13 @@ def make_job(
     limit="1:00:00",
     user="",
     group="",
+    partition="nvgpu",
 ):
     return Job(
         job_id=job_id,
         name=name,
         state=state,
-        partition="nvgpu",
+        partition=partition,
         nodes="h2node01",
         reason="",
         elapsed=elapsed,
@@ -279,6 +288,22 @@ class NodeFilterTests(unittest.TestCase):
         disabled = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="history")
         self.assertEqual(disabled._active_refresh_seconds(), 0)
 
+    def test_jobs_view_uses_five_second_refresh_interval_after_fifty_jobs(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=2)
+        app.state.jobs = [make_job(str(index)) for index in range(50)]
+        self.assertEqual(app._active_refresh_seconds(), 2)
+
+        app.state.jobs.append(make_job("50"))
+        self.assertEqual(app._active_refresh_seconds(), BUSY_JOBS_REFRESH_SECONDS)
+
+        slower = VaccsRunningApp(FakeClient(), refresh_seconds=10)
+        slower.state.jobs = [make_job(str(index)) for index in range(51)]
+        self.assertEqual(slower._active_refresh_seconds(), 10)
+
+        disabled = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        disabled.state.jobs = [make_job(str(index)) for index in range(51)]
+        self.assertEqual(disabled._active_refresh_seconds(), 0)
+
     def test_jobs_header_shows_group_toggle(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
         screen = FakeScreen(height=12, width=100)
@@ -289,7 +314,7 @@ class NodeFilterTests(unittest.TestCase):
         self.assertIn(" g group ", written)
         self.assertNotIn(" c show-completed ", written)
         self.assertIn(" f filter ", written)
-        self.assertIn(" s script ", written)
+        self.assertNotIn(" s script ", written)
 
     def test_jobs_header_shows_squeue_state_filter(self):
         app = VaccsRunningApp(StateFilteredClient(), refresh_seconds=0)
@@ -310,6 +335,21 @@ class NodeFilterTests(unittest.TestCase):
 
         written = " ".join(write[2] for write in screen.writes)
         self.assertIn(" user: all users ", written)
+
+    def test_jobs_header_shows_partition_filter(self):
+        client = JobsFilterClient()
+        client.set_job_partition_filters({"nvgpu"})
+        app = VaccsRunningApp(client, refresh_seconds=0)
+        screen = FakeScreen(height=12, width=120)
+
+        app._draw_header(screen, 120)
+
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn(" partition: nvgpu ", written)
+        self.assertIn("Filter by partition: nvgpu", " ".join(
+            str(item["label"])
+            for item in app._jobs_filter_home_items()
+        ))
 
     def test_jobs_header_summarizes_multiple_users_and_groups(self):
         client = JobsFilterClient()
@@ -828,6 +868,7 @@ class NodeFilterTests(unittest.TestCase):
         self.assertIn("Filter by status", written)
         self.assertIn("Filter by user", written)
         self.assertIn("Filter by group", written)
+        self.assertIn("Filter by partition", written)
         self.assertNotIn("Clear filters", written)
         self.assertIn("filter by status", written)
         self.assertNotIn("a select-all", written)
@@ -838,6 +879,7 @@ class NodeFilterTests(unittest.TestCase):
         self.assertTrue(any(label.startswith("Filter by status") for label in home_labels))
         self.assertTrue(any(label.startswith("Filter by user") for label in home_labels))
         self.assertTrue(any(label.startswith("Filter by group") for label in home_labels))
+        self.assertTrue(any(label.startswith("Filter by partition") for label in home_labels))
         self.assertNotIn("Clear filters", home_labels)
 
     def test_jobs_filter_menu_accepts_typed_user(self):
@@ -920,6 +962,47 @@ class NodeFilterTests(unittest.TestCase):
         self.assertEqual(client.job_groups, {"pi-custom"})
         self.assertEqual(client.refreshes, 1)
 
+    def test_jobs_filter_menu_accepts_typed_partition(self):
+        import vaccs_running.ui as ui
+
+        client = JobsFilterClient()
+        app = VaccsRunningApp(client, refresh_seconds=0)
+        screen = FakeScreen(height=40, width=120)
+        popup = FakePopupWindow(
+            keys=[
+                ord("p"),
+                ord("p"),
+                ord("g"),
+                ord("p"),
+                ord("u"),
+                ord("-"),
+                ord("c"),
+                ord("u"),
+                ord("s"),
+                ord("t"),
+                ord("o"),
+                ord("m"),
+                ord("\n"),
+                ord("q"),
+            ],
+        )
+        original_newwin = curses.newwin
+        try:
+            def fake_newwin(height, width, top, left):
+                popup.height = height
+                popup.width = width
+                popup.positions.append((top, left))
+                return popup
+
+            curses.newwin = fake_newwin
+
+            self.assertTrue(app._handle_key(screen, ord("f")))
+        finally:
+            curses.newwin = original_newwin
+
+        self.assertEqual(client.job_partitions, {"gpu-custom"})
+        self.assertEqual(client.refreshes, 1)
+
     def test_jobs_filter_typeahead_filters_and_adds_custom_values(self):
         self.assertEqual(
             filter_choice_options(["alice", "other", "testuser"], "oth"),
@@ -949,7 +1032,22 @@ class NodeFilterTests(unittest.TestCase):
         self.assertEqual(client.job_groups, set())
         self.assertIn("zoe", choices.users)
 
-    def test_jobs_filter_submenus_list_current_users_and_groups(self):
+        popup = FakePopupWindow(keys=[ord("d"), ord("e"), ord("b"), ord("u"), ord("g"), ord("\n")])
+        popup.height = 10
+        popup.width = 60
+
+        app._activate_jobs_partition_filter_item(
+            popup,
+            10,
+            60,
+            choices,
+            {"kind": "action", "action": "custom_partition"},
+        )
+
+        self.assertEqual(client.job_partitions, {"debug"})
+        self.assertIn("debug", choices.partitions)
+
+    def test_jobs_filter_submenus_list_current_users_groups_and_partitions(self):
         client = JobsFilterClient()
         app = VaccsRunningApp(client, refresh_seconds=0)
         choices = client.fetch_running_filter_choices()
@@ -961,6 +1059,10 @@ class NodeFilterTests(unittest.TestCase):
         group_labels = [
             str(item["label"])
             for item in app._jobs_group_filter_items(choices)
+        ]
+        partition_labels = [
+            str(item["label"])
+            for item in app._jobs_partition_filter_items(choices)
         ]
 
         self.assertEqual(
@@ -980,6 +1082,12 @@ class NodeFilterTests(unittest.TestCase):
         self.assertNotIn("Select all groups", group_labels)
         self.assertNotIn("Clear group selection", group_labels)
         self.assertIn("pi-example", group_labels)
+        self.assertEqual(
+            partition_labels[:3],
+            ["Select all", "Clear all", "Enter partition name..."],
+        )
+        self.assertIn("gpu-preempt", partition_labels)
+        self.assertIn("nvgpu", partition_labels)
 
     def test_jobs_filter_menu_clears_filters(self):
         import vaccs_running.ui as ui
@@ -987,6 +1095,7 @@ class NodeFilterTests(unittest.TestCase):
         client = JobsFilterClient()
         client.set_job_state_filter("PD")
         client.set_job_user_filter("all")
+        client.set_job_partition_filters({"nvgpu"})
         app = VaccsRunningApp(client, refresh_seconds=0)
         screen = FakeScreen(height=40, width=120)
         popup = FakePopupWindow(keys=[ord("c"), ord("q")])
@@ -1007,6 +1116,7 @@ class NodeFilterTests(unittest.TestCase):
         self.assertEqual(client.squeue_states, "all")
         self.assertEqual(client.job_users, {"testuser"})
         self.assertEqual(client.job_groups, set())
+        self.assertEqual(client.job_partitions, set())
         self.assertEqual(client.refreshes, 1)
 
     def test_g_toggles_job_grouping_in_jobs_view(self):
@@ -1172,61 +1282,6 @@ class NodeFilterTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [("squeue -a -w h2node01", "jobs for h2node01", (ord("p"),))],
-        )
-
-    def test_s_opens_selected_job_script(self):
-        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
-        calls = []
-        app.state.jobs = [make_job("4413548_2", name="train")]
-        app._popup_command = lambda stdscr, title, fn, arg, close_keys=(): calls.append(
-            (title, fn(arg), close_keys)
-        )
-
-        self.assertTrue(app._handle_key(None, ord("s")))
-
-        self.assertEqual(
-            calls,
-            [
-                (
-                    "scontrol write batch_script 4413548 -",
-                    "#!/bin/bash\n#SBATCH --job-name=4413548\n",
-                    (ord("s"),),
-                )
-            ],
-        )
-
-    def test_s_opens_grouped_job_script(self):
-        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
-        calls = []
-        app.state.jobs_grouped = True
-        app.state.jobs = [
-            make_job("4413548_1", "PENDING", name="train"),
-            make_job("4413548_2", "RUNNING", name="train"),
-        ]
-        app.state.job_records = [
-            make_record("4413548_1", "PENDING", name="train"),
-            make_record(
-                "4413548_2",
-                "RUNNING",
-                name="train",
-                end_time="Unknown",
-            ),
-        ]
-        app._popup_command = lambda stdscr, title, fn, arg, close_keys=(): calls.append(
-            (title, fn(arg), close_keys)
-        )
-
-        self.assertTrue(app._handle_key(None, ord("s")))
-
-        self.assertEqual(
-            calls,
-            [
-                (
-                    "scontrol write batch_script 4413548 -",
-                    "#!/bin/bash\n#SBATCH --job-name=4413548\n",
-                    (ord("s"),),
-                )
-            ],
         )
 
     def test_nodes_header_shows_usage_shortcut(self):

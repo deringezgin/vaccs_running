@@ -3,7 +3,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 
 from vaccs_running import __version__
-from vaccs_running.__main__ import build_parser, make_client
+from vaccs_running.__main__ import ADMIN_SQUEUE_STATES, build_parser, make_client
 
 
 class CliTests(unittest.TestCase):
@@ -22,9 +22,24 @@ class CliTests(unittest.TestCase):
         alias_args = build_parser().parse_args(["--states", "all"])
         self.assertEqual(alias_args.states, "all")
 
+        default_args = build_parser().parse_args([])
+        self.assertIsNone(default_args.states)
+
     def test_state_option_rejects_invalid_tokens(self):
         with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
             build_parser().parse_args(["--state", "PD;RUNNING"])
+
+    def test_partition_option_accepts_comma_list(self):
+        args = build_parser().parse_args(["--partition", "nvgpu, gpu-preempt"])
+        self.assertEqual(args.partitions, "nvgpu,gpu-preempt")
+
+        short_args = build_parser().parse_args(["-p", "gpu-debug"])
+        self.assertEqual(short_args.partitions, "gpu-debug")
+
+    def test_admin_option_sets_admin_mode_argument(self):
+        args = build_parser().parse_args(["--admin"])
+
+        self.assertTrue(args.admin)
 
     def test_version_option_prints_package_version(self):
         output = StringIO()
@@ -43,6 +58,29 @@ class CliTests(unittest.TestCase):
         self.assertEqual(client.job_user_label, "all users")
         self.assertEqual(client.squeue_states, "PD")
 
+    def test_admin_starts_with_all_users_running_pending_filter(self):
+        client = make_client(None, None, admin=True)
+
+        self.assertTrue(client.job_all_principals)
+        self.assertEqual(client.job_users, set())
+        self.assertEqual(client.job_groups, set())
+        self.assertEqual(client.job_user_label, "all users")
+        self.assertEqual(client.squeue_states, ADMIN_SQUEUE_STATES)
+        self.assertTrue(client.state_filter_active)
+        self.assertTrue(client.job_user_filter_active)
+
+    def test_admin_respects_explicit_state_and_partition_filter(self):
+        client = make_client(
+            None,
+            "PD",
+            partitions="nvgpu,gpu-preempt",
+            admin=True,
+        )
+
+        self.assertTrue(client.job_all_principals)
+        self.assertEqual(client.squeue_states, "PD")
+        self.assertEqual(client.job_partitions, {"nvgpu", "gpu-preempt"})
+
     def test_user_name_starts_with_single_user_filter(self):
         client = make_client("testuser", "all")
 
@@ -59,12 +97,13 @@ class CliTests(unittest.TestCase):
         self.assertEqual(client.job_user_label, "1 group")
 
     def test_user_group_and_state_can_be_combined_at_startup(self):
-        client = make_client("testuser", "pd", "pi-example")
+        client = make_client("testuser", "pd", "pi-example", "nvgpu,gpu-preempt")
 
         self.assertEqual(client.squeue_states, "PD")
         self.assertEqual(client.user, "testuser")
         self.assertEqual(client.job_users, {"testuser"})
         self.assertEqual(client.job_groups, {"pi-example"})
+        self.assertEqual(client.job_partitions, {"nvgpu", "gpu-preempt"})
 
 
 if __name__ == "__main__":

@@ -8,6 +8,9 @@ from .slurm import SlurmClient, SlurmError, normalize_squeue_states
 from .ui import VaccsRunningApp
 
 
+ADMIN_SQUEUE_STATES = "R,PD"
+
+
 def is_all_user_selector(value: str | None) -> bool:
     return bool(value and value.strip().lower() == "all")
 
@@ -17,6 +20,17 @@ def slurm_state_arg(value: str) -> str:
         return normalize_squeue_states(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def comma_list_arg(value: str) -> str:
+    values = [
+        item.strip()
+        for item in value.split(",")
+        if item.strip()
+    ]
+    if not values:
+        raise argparse.ArgumentTypeError("expected at least one value")
+    return ",".join(values)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,6 +50,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Slurm group/account to inspect in the jobs view.",
     )
     parser.add_argument(
+        "--admin",
+        action="store_true",
+        help=(
+            "Start the Jobs view filtered to running and pending jobs from all users."
+        ),
+    )
+    parser.add_argument(
+        "-p",
+        "--partition",
+        "--partitions",
+        dest="partitions",
+        type=comma_list_arg,
+        help="Comma-separated Slurm partitions to inspect in the jobs view.",
+    )
+    parser.add_argument(
         "-r", "--refresh",
         type=float,
         default=2.0,
@@ -47,7 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--states",
         dest="states",
         type=slurm_state_arg,
-        default="all",
+        default=None,
         help=(
             "Comma-separated Slurm states passed to squeue -t for the jobs view, "
             "for example PD or RUNNING,PENDING. Default: all."
@@ -61,7 +90,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def make_client(user: str | None, states: str, group: str | None = None) -> SlurmClient:
+def make_client(
+    user: str | None,
+    states: str | None,
+    group: str | None = None,
+    partitions: str | None = None,
+    admin: bool = False,
+) -> SlurmClient:
+    if admin and states is None:
+        states = ADMIN_SQUEUE_STATES
     client = SlurmClient(
         user=None if is_all_user_selector(user) else user,
         states=states,
@@ -72,14 +109,24 @@ def make_client(user: str | None, states: str, group: str | None = None) -> Slur
         if user and not is_all_user_selector(user):
             users.add(user.strip())
         client.set_job_principal_filters(users=users, groups={group})
+    elif admin:
+        client.set_job_user_filter("all")
     elif is_all_user_selector(user):
         client.set_job_user_filter(user)
+    if partitions:
+        client.set_job_partition_filters(partitions.split(","))
     return client
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    client = make_client(args.user, args.states, args.group)
+    client = make_client(
+        args.user,
+        args.states,
+        args.group,
+        args.partitions,
+        admin=args.admin,
+    )
 
     try:
         VaccsRunningApp(

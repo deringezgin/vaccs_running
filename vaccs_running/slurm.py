@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import getpass
 import os
 import re
@@ -36,7 +36,17 @@ SQUEUE_FIELDS = [
 ]
 
 SQUEUE_FORMAT = "%i|%j|%T|%P|%N|%R|%M|%l|%D|%C|%b|%V|%S|%u|%g"
-FILTER_CHOICES_FORMAT = "%u|%g"
+FILTER_CHOICES_FORMAT = "%u|%g|%P"
+VACC_PARTITIONS = [
+    "general",
+    "short",
+    "week",
+    "nvgpu",
+    "gpu-debug",
+    "gpu-preempt",
+    "hgnodes",
+    "goldenmaple",
+]
 SACCT_FIELDS = [
     "job_id",
     "raw_job_id",
@@ -335,6 +345,7 @@ class UserUsage:
 class JobFilterChoices:
     users: list[str]
     groups: list[str]
+    partitions: list[str] = field(default_factory=list)
 
 
 class CommandRunner:
@@ -366,6 +377,7 @@ class SlurmClient:
         self.user = user or os.environ.get("USER") or getpass.getuser()
         self.job_users: set[str] = {self.user}
         self.job_groups: set[str] = set()
+        self.job_partitions: set[str] = set()
         self.job_all_principals = False
         self.squeue_states = normalize_squeue_states(states)
         self.runner = CommandRunner()
@@ -383,6 +395,10 @@ class SlurmClient:
         )
 
     @property
+    def job_partition_filter_active(self) -> bool:
+        return bool(self.job_partitions)
+
+    @property
     def job_user_label(self) -> str:
         if self.job_all_principals:
             return "all users"
@@ -395,7 +411,11 @@ class SlurmClient:
 
     @property
     def job_filter_active(self) -> bool:
-        return self.state_filter_active or self.job_user_filter_active
+        return (
+            self.state_filter_active
+            or self.job_user_filter_active
+            or self.job_partition_filter_active
+        )
 
     def set_job_state_filter(self, states: str | None) -> None:
         self.squeue_states = normalize_squeue_states(states)
@@ -434,9 +454,17 @@ class SlurmClient:
         if not self.job_all_principals and not self.job_users and not self.job_groups:
             self.job_users = {self.user}
 
+    def set_job_partition_filters(self, partitions: Iterable[str] | None) -> None:
+        self.job_partitions = {
+            partition.strip()
+            for partition in (partitions or [])
+            if partition and partition.strip()
+        }
+
     def clear_job_filters(self) -> None:
         self.squeue_states = DEFAULT_SQUEUE_STATES
         self.set_job_principal_filters(users={self.user})
+        self.job_partitions = set()
 
     def fetch_jobs(self, states: str | None = None) -> list[Job]:
         squeue_states = (
@@ -444,13 +472,17 @@ class SlurmClient:
             if states is None
             else normalize_squeue_states(states)
         )
-        output = self._fetch_jobs(squeue_states, self._query_users())
+        output = self._fetch_jobs(
+            squeue_states,
+            self._query_users(),
+            self.job_partitions,
+        )
         jobs: list[Job] = []
         for line in output.splitlines():
             if not line.strip():
                 continue
             jobs.append(parse_squeue_line(line))
-        return self._filter_jobs_by_principals(jobs)
+        return self._filter_jobs_by_partitions(self._filter_jobs_by_principals(jobs))
 
     def _query_users(self) -> set[str] | None:
         if self.job_all_principals or self.job_groups:
@@ -465,11 +497,25 @@ class SlurmClient:
             return jobs
         return jobs
 
-    def _fetch_jobs(self, states: str, users: Iterable[str] | None) -> str:
+    def _filter_jobs_by_partitions(self, jobs: list[Job]) -> list[Job]:
+        if not self.job_partitions:
+            return jobs
+        partitions = self.job_partitions
+        return [job for job in jobs if job.partition in partitions]
+
+    def _fetch_jobs(
+        self,
+        states: str,
+        users: Iterable[str] | None,
+        partitions: Iterable[str] | None = None,
+    ) -> str:
         args = ["squeue", "--array", "-h"]
         user_list = sorted(user for user in (users or []) if user)
         if user_list:
             args.extend(["-u", ",".join(user_list)])
+        partition_list = sorted(partition for partition in (partitions or []) if partition)
+        if partition_list:
+            args.extend(["-p", ",".join(partition_list)])
         args.extend(["-t", states, "-o", SQUEUE_FORMAT])
         return self.runner.run(args, timeout=15.0)
 
@@ -490,7 +536,10 @@ class SlurmClient:
     def fetch_job_history(self, window: str) -> list[JobRecord]:
         jobs = [
             parse_squeue_line(line)
-            for line in self._fetch_jobs(DEFAULT_SQUEUE_STATES, {self.user}).splitlines()
+            for line in self._fetch_jobs(
+                DEFAULT_SQUEUE_STATES,
+                {self.user},
+            ).splitlines()
             if line.strip()
         ]
         live_records = [record_from_job(job) for job in jobs]
@@ -538,15 +587,25 @@ class SlurmClient:
         )
         users: set[str] = set()
         groups: set[str] = set()
+        partitions: set[str] = set(VACC_PARTITIONS)
         for line in output.splitlines():
-            user, _, group = line.partition("|")
+            parts = line.rstrip("\n").split("|")
+            parts.extend([""] * max(0, 3 - len(parts)))
+            user, group, partition = (part.strip() for part in parts[:3])
             user = user.strip()
             group = group.strip()
+            partition = partition.strip()
             if user:
                 users.add(user)
             if group:
                 groups.add(group)
-        return JobFilterChoices(users=sorted(users), groups=sorted(groups))
+            if partition:
+                partitions.add(partition)
+        return JobFilterChoices(
+            users=sorted(users),
+            groups=sorted(groups),
+            partitions=sorted(partitions),
+        )
 
     def fetch_nodes(self) -> list[Node]:
         output = self.runner.run(["scontrol", "show", "node"], timeout=20.0)
@@ -554,12 +613,6 @@ class SlurmClient:
 
     def show_job(self, job_id: str) -> str:
         return self.runner.run(["scontrol", "show", "job", job_id], timeout=12.0)
-
-    def show_job_script(self, job_id: str) -> str:
-        return self.runner.run(
-            ["scontrol", "write", "batch_script", job_id, "-"],
-            timeout=12.0,
-        )
 
     def show_node(self, node_name: str) -> str:
         return self.runner.run(["scontrol", "show", "node", node_name], timeout=12.0)

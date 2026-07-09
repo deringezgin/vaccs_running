@@ -33,8 +33,7 @@ that:
 ./vaccs-running --refresh 1
 ```
 
-To prefilter the Jobs view by Slurm state, pass the state list through to
-`squeue`:
+To prefilter the Jobs view by Slurm state, group, or partition:
 
 ```bash
 ./vaccs-running --state PD
@@ -42,6 +41,9 @@ To prefilter the Jobs view by Slurm state, pass the state list through to
 ./vaccs-running --user all --state PD
 ./vaccs-running --group pi-example
 ./vaccs-running -g pi-example --state RUNNING
+./vaccs-running --partition nvgpu
+./vaccs-running --partitions nvgpu,gpu-preempt
+./vaccs-running --admin
 ```
 
 > ⚠️  As auto-refresh queries Slurm, please use an interval larger than 1 second.
