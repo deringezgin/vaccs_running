@@ -7,7 +7,7 @@
   </a>
 </p>
 
-A colorful terminal UI for checking your jobs on the Vermont Advanced Computing Cluster and viewing the node availability.
+A colorful terminal UI for checking your jobs on the Vermont Advanced Computing Cluster, viewing node availability, and browsing per-user cluster usage.
 
 > This project is not affiliated in any way with UVM, VACC, or the Vermont Complex Systems Institute.
 
@@ -47,6 +47,29 @@ To prefilter the Jobs view by Slurm state, group, or partition:
 ```
 
 > ⚠️  As auto-refresh queries Slurm, please use an interval larger than 1 second.
+
+## Usage
+
+Press `u` (or start with `--usage` / `-U`) to open the **Usage** tab: a per-user
+ranking of cluster usage split into three panes — last 24 hours, last 7 days,
+and last 30 days — each showing CPU-hours, GPU-hours, and the current Slurm
+fairshare score.
+
+Because these `sreport` queries are heavy, this view does **not** auto-refresh.
+It loads once when you open it and each pane fills in as its query returns;
+press `r` to refresh on demand.
+
+- `m` — switch mode between ranking by user and by group/account
+- `f` — find: filter the rows live by name as you type (`Enter` keeps it, `Esc` clears); a
+  matched row keeps its overall rank (find the 32nd user and they still show as 32)
+- `s` — cycle the sort column (CPU / GPU / fairshare)
+- `o` — toggle the order (ascending / descending)
+- `r` — refresh all panes (loads once on open; refresh is manual)
+- `↑ ↓ PgUp PgDn Home End` — scroll the ranking in all panes
+
+The Usage view is a wide, desktop-oriented view; on a screen that is too small
+(for example a phone terminal) it shows a notice asking for a bigger screen
+instead of a broken layout.
 
 ## Install As A Command
 

@@ -57,6 +57,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "-U",
+        "--usage",
+        action="store_true",
+        help="Open directly on the Usage view.",
+    )
+    parser.add_argument(
         "-p",
         "--partition",
         "--partitions",
@@ -132,6 +138,7 @@ def main(argv: list[str] | None = None) -> int:
         VaccsRunningApp(
             client=client,
             refresh_seconds=max(0.0, args.refresh),
+            initial_view="leaderboard" if args.usage else "jobs",
         ).run()
         return 0
     except KeyboardInterrupt:

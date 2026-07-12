@@ -41,6 +41,11 @@ class CliTests(unittest.TestCase):
 
         self.assertTrue(args.admin)
 
+    def test_usage_option_sets_flag(self):
+        self.assertFalse(build_parser().parse_args([]).usage)
+        self.assertTrue(build_parser().parse_args(["--usage"]).usage)
+        self.assertTrue(build_parser().parse_args(["-U"]).usage)
+
     def test_version_option_prints_package_version(self):
         output = StringIO()
         with redirect_stdout(output), self.assertRaises(SystemExit) as caught:

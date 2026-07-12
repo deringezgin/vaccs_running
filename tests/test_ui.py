@@ -1,13 +1,26 @@
 import curses
 import unittest
 
-from vaccs_running.slurm import Job, JobFilterChoices, JobRecord, Node
+from vaccs_running.slurm import (
+    Job,
+    JobFilterChoices,
+    JobRecord,
+    LEADERBOARD_WINDOWS,
+    Node,
+    UsageEntry,
+)
 from vaccs_running.ui import (
     BUSY_JOBS_REFRESH_SECONDS,
     HISTORY_REFRESH_SECONDS,
+    LEADERBOARD_GRID_TOP,
+    LEADERBOARD_MIN_HEIGHT,
+    LEADERBOARD_MIN_WIDTH,
+    LEADERBOARD_PAGE,
     VaccsRunningApp,
     command_text,
     filter_choice_options,
+    leaderboard_columns,
+    leaderboard_too_small,
     page_status,
     popup_geometry,
     resource_count_width,
@@ -38,6 +51,64 @@ class FakeClient:
 
     def cluster_usage(self):
         return "usage by user"
+
+    def fetch_usage_window(self, window):
+        return []
+
+    def fetch_fairshare(self):
+        return {}
+
+
+class LeaderboardClient(FakeClient):
+    """Returns fixed usage/fairshare and records how often each is fetched."""
+
+    def __init__(self):
+        self.usage_calls = []
+        self.fairshare_calls = 0
+
+    def fetch_usage_window(self, window):
+        self.usage_calls.append(window)
+        return [
+            UsageEntry("", "pi-x", 1000, 50),  # account total (used by groups)
+            UsageEntry("alice", "pi-x", 700, 40),
+            UsageEntry("bob", "pi-x", 300, 10),
+            UsageEntry("", "root", 99999, 9999),  # cluster total, never shown
+        ]
+
+    def fetch_fairshare(self):
+        self.fairshare_calls += 1
+        return {("alice", "pi-x"): 0.42, ("bob", "pi-x"): 0.90}
+
+
+class FindLeaderboardClient(FakeClient):
+    """Named users so the live find filter is observable."""
+
+    def fetch_usage_window(self, window):
+        return [
+            UsageEntry("dgezgin", "pi-x", 300, 30),
+            UsageEntry("derek", "pi-x", 200, 20),
+            UsageEntry("alice", "pi-x", 100, 10),
+        ]
+
+    def fetch_fairshare(self):
+        return {}
+
+
+class ScrollLeaderboardClient(FakeClient):
+    """Returns enough users (u00..u29) to overflow a pane so scrolling matters."""
+
+    def __init__(self, count=30):
+        self.count = count
+
+    def fetch_usage_window(self, window):
+        # Descending gpu_hours so sort-by-gpu yields u00 (rank 1) .. u29.
+        return [
+            UsageEntry(f"u{i:02d}", "pi-x", (self.count - i) * 10, self.count - i)
+            for i in range(self.count)
+        ]
+
+    def fetch_fairshare(self):
+        return {}
 
 
 class StateFilteredClient(FakeClient):
@@ -379,17 +450,22 @@ class NodeFilterTests(unittest.TestCase):
         self.assertNotIn("testuser", filter_labels)
         self.assertNotIn("pi-example", filter_labels)
 
-    def test_history_header_shows_filter_without_group_toggle(self):
+    def test_history_header_shows_all_filter_windows_inline(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="history")
         screen = FakeScreen(height=12, width=120)
 
         app._draw_header(screen, 120)
 
         written = " ".join(write[2] for write in screen.writes)
-        self.assertIn(" f filter: 24h ", written)
+        # Every window is listed inline; the active one (24h) is highlighted.
+        self.assertIn("f filter:", written)
+        for window in ("1h", "3h", "24h", "3d", "7d"):
+            self.assertIn(window, written)
         self.assertNotIn(" g group ", written)
-        self.assertNotIn(" 1 1h ", written)
-        self.assertNotIn(" 3 3h ", written)
+        # 24h is the active window and carries the highlight attribute.
+        active_attr = next(w[3] for w in screen.writes if w[2] == "24h")
+        other_attr = next(w[3] for w in screen.writes if w[2] == "7d")
+        self.assertNotEqual(active_attr, other_attr)
 
     def test_accent_color_uses_requested_dc582a(self):
         import vaccs_running.ui as ui
@@ -798,9 +874,7 @@ class NodeFilterTests(unittest.TestCase):
         self.assertEqual(app.state.history_window, "24h")
         self.assertEqual(client.windows, [])
 
-    def test_f_opens_history_filter_menu_and_applies_selected_window(self):
-        import vaccs_running.ui as ui
-
+    def test_f_cycles_history_window_and_refetches(self):
         class HistoryClient(FakeClient):
             def __init__(self):
                 self.windows = []
@@ -811,30 +885,18 @@ class NodeFilterTests(unittest.TestCase):
 
         client = HistoryClient()
         app = VaccsRunningApp(client, refresh_seconds=0, initial_view="history")
-        screen = FakeScreen(height=40, width=120)
-        popup = FakePopupWindow(keys=[curses.KEY_UP, ord("\n")])
-        original_newwin = curses.newwin
-        try:
-            def fake_newwin(height, width, top, left):
-                popup.height = height
-                popup.width = width
-                popup.positions.append((top, left))
-                return popup
+        self.assertEqual(app.state.history_window, "24h")
 
-            curses.newwin = fake_newwin
+        # 'f' advances to the next window (24h -> 3d) and refetches that window.
+        self.assertTrue(app._handle_key(None, ord("f")))
+        self.assertEqual(app.state.history_window, "3d")
+        self.assertEqual(client.windows[-1], "3d")
+        self.assertEqual(app.state.history[0].job_id, "job-3d")
 
-            self.assertTrue(app._handle_key(screen, ord("f")))
-        finally:
-            curses.newwin = original_newwin
-
-        self.assertEqual(app.state.history_window, "3h")
-        self.assertEqual(client.windows, ["3h"])
-        self.assertEqual(app.state.history[0].job_id, "job-3h")
-        written = " ".join(write[2] for write in popup.writes)
-        self.assertIn("history filter", written)
-        self.assertIn("last 3 hours", written)
-        self.assertIn("last 7 days", written)
-        self.assertNotIn("all time", written)
+        # Continues through the list and wraps back to the start.
+        for expected in ("7d", "1h", "3h", "24h"):
+            app._handle_key(None, ord("f"))
+            self.assertEqual(app.state.history_window, expected)
 
     def test_status_filter_empty_selection_means_all(self):
         import vaccs_running.ui as ui
@@ -1575,6 +1637,522 @@ class NodeFilterTests(unittest.TestCase):
 
         self.assertEqual(count_width, len("120G/1000G"))
         self.assertEqual([row.index("[") for row in rows], [11, 11, 11])
+
+
+def rendered_text(screen):
+    return " ".join(write[2].strip() for write in screen.writes)
+
+
+def load_leaderboard(app):
+    """Kick off the background fetch and block until every thread finishes."""
+    app._start_leaderboard_refresh()
+    for thread in list(app._lb_threads):
+        thread.join(timeout=5)
+
+
+class LeaderboardTests(unittest.TestCase):
+    def test_leaderboard_too_small_requires_desktop_size(self):
+        self.assertTrue(leaderboard_too_small(80, 40))
+        self.assertTrue(leaderboard_too_small(120, 18))
+        self.assertFalse(
+            leaderboard_too_small(LEADERBOARD_MIN_WIDTH, LEADERBOARD_MIN_HEIGHT)
+        )
+
+    def test_leaderboard_columns_drop_fairshare_when_narrow(self):
+        def keys(width, **kw):
+            return [key for key, _label, _w, _a in leaderboard_columns(width, "USER", **kw)]
+
+        # Group mode (no GROUP column): wide keeps FS, narrow drops it.
+        self.assertEqual(keys(48), ["rank", "name", "cpu", "gpu", "fs"])
+        self.assertEqual(keys(20), ["rank", "name", "cpu", "gpu"])
+
+    def test_leaderboard_columns_show_group_and_drop_it_last(self):
+        def keys(width):
+            return [key for key, _l, _w, _a in leaderboard_columns(width, "USER", group_col=True)]
+
+        # Wide: rank, name, GROUP, cpu, gpu, FS all present.
+        self.assertEqual(keys(60), ["rank", "name", "group", "cpu", "gpu", "fs"])
+        # Narrower: FS drops first, GROUP stays (the user asked for it).
+        self.assertEqual(keys(36), ["rank", "name", "group", "cpu", "gpu"])
+        # Narrowest: GROUP drops too, keeping the core metrics legible.
+        self.assertEqual(keys(24), ["rank", "name", "cpu", "gpu"])
+
+    def test_header_shows_leaders_tab_and_controls(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="leaderboard")
+        screen = FakeScreen(height=40, width=140)
+
+        app._draw_header(screen, screen.width)
+
+        written = rendered_text(screen)
+        self.assertIn("u Usage", written)
+        # The refresh control is intentionally not advertised in the header.
+        self.assertNotIn("r refresh", written)
+        # Each control lists all its options; the active one is highlighted.
+        self.assertIn("m mode:", written)
+        self.assertIn("user", written)
+        self.assertIn("group", written)
+        self.assertIn("f find", written)
+        self.assertIn("s sort:", written)
+        self.assertIn("CPU", written)
+        self.assertIn("GPU", written)
+        self.assertIn("fairshare", written)
+        self.assertIn("o order:", written)
+        self.assertIn("ascending", written)
+        self.assertIn("descending", written)
+        self.assertIn("q quit", written)
+
+    def test_header_highlights_the_active_mode_option(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="leaderboard")
+
+        def attr_of(word):
+            screen = FakeScreen(height=40, width=140)
+            app._draw_header(screen, screen.width)
+            return next(w[3] for w in screen.writes if w[2] == word)
+
+        # In user mode, "user" is highlighted (active-tab pair) and "group" is not.
+        user_attr, group_attr = attr_of("user"), attr_of("group")
+        self.assertNotEqual(user_attr, group_attr)
+        # Switching to group mode flips which word carries the highlight.
+        app.state.leaderboard_group_mode = True
+        self.assertEqual(attr_of("user"), group_attr)
+        self.assertEqual(attr_of("group"), user_attr)
+
+    def test_u_key_switches_to_usage(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        self.assertTrue(app._handle_key(None, ord("u")))
+        self.assertEqual(app.state.view, "leaderboard")
+
+    def test_leaderboard_never_auto_refreshes(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=2, initial_view="leaderboard")
+        self.assertEqual(app._active_refresh_seconds(), 0.0)
+
+    def test_mode_key_toggles_grouping_and_resets_scroll(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="leaderboard")
+        app.state.leaderboard_scroll = 4
+
+        self.assertTrue(app._handle_leaderboard_key(ord("m")))
+        self.assertTrue(app.state.leaderboard_group_mode)
+        self.assertEqual(app.state.leaderboard_scroll, 0)
+
+        app._handle_leaderboard_key(ord("m"))
+        self.assertFalse(app.state.leaderboard_group_mode)
+
+    def test_sort_key_cycles_through_metrics(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="leaderboard")
+        # Cycles left-to-right through the header display: GPU -> CPU -> fairshare.
+        self.assertEqual(app.state.leaderboard_sort, "gpu")
+        app._handle_leaderboard_key(ord("s"))
+        self.assertEqual(app.state.leaderboard_sort, "cpu")
+        app._handle_leaderboard_key(ord("s"))
+        self.assertEqual(app.state.leaderboard_sort, "fairshare")
+        app._handle_leaderboard_key(ord("s"))
+        self.assertEqual(app.state.leaderboard_sort, "gpu")
+
+    def test_order_key_toggles_direction_and_resets_scroll(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="leaderboard")
+        app.state.leaderboard_scroll = 5
+        self.assertFalse(app.state.leaderboard_ascending)  # descending by default
+
+        self.assertTrue(app._handle_leaderboard_key(ord("o")))
+        self.assertTrue(app.state.leaderboard_ascending)
+        self.assertEqual(app.state.leaderboard_scroll, 0)
+
+        app._handle_leaderboard_key(ord("o"))
+        self.assertFalse(app.state.leaderboard_ascending)
+
+    def test_header_highlights_active_sort_option(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="leaderboard")
+
+        def attr_of(word):
+            screen = FakeScreen(height=40, width=160)
+            app._draw_header(screen, screen.width)
+            return next(w[3] for w in screen.writes if w[2] == word)
+
+        gpu_attr, cpu_attr = attr_of("GPU"), attr_of("CPU")  # GPU active by default
+        self.assertNotEqual(gpu_attr, cpu_attr)
+        app.state.leaderboard_sort = "cpu"
+        self.assertEqual(attr_of("CPU"), gpu_attr)
+        self.assertEqual(attr_of("GPU"), cpu_attr)
+
+    def test_header_highlights_active_order_option(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="leaderboard")
+
+        def attr_of(word):
+            screen = FakeScreen(height=40, width=160)
+            app._draw_header(screen, screen.width)
+            return next(w[3] for w in screen.writes if w[2] == word)
+
+        desc_attr, asc_attr = attr_of("descending"), attr_of("ascending")
+        self.assertNotEqual(desc_attr, asc_attr)  # descending active by default
+        app.state.leaderboard_ascending = True
+        self.assertEqual(attr_of("ascending"), desc_attr)
+        self.assertEqual(attr_of("descending"), asc_attr)
+
+    def test_order_direction_reranks_the_panes(self):
+        app = VaccsRunningApp(
+            ScrollLeaderboardClient(5), refresh_seconds=0, initial_view="leaderboard"
+        )
+        load_leaderboard(app)
+        # Descending by GPU: u00 (highest) is rank 1.
+        top_desc = app._leaderboard_snapshot()["24h"]["rows"][0]
+        self.assertEqual((top_desc[0], top_desc[1].name), (1, "u00"))
+        # Ascending flips it: the lowest-GPU user becomes rank 1.
+        app.state.leaderboard_ascending = True
+        top_asc = app._leaderboard_snapshot()["24h"]["rows"][0]
+        self.assertEqual((top_asc[0], top_asc[1].name), (1, "u04"))
+
+    def test_arrow_keys_scroll_but_tab_keys_pass_through(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="leaderboard")
+
+        self.assertTrue(app._handle_leaderboard_key(curses.KEY_DOWN))
+        self.assertEqual(app.state.leaderboard_scroll, 1)
+        self.assertTrue(app._handle_leaderboard_key(curses.KEY_UP))
+        self.assertEqual(app.state.leaderboard_scroll, 0)
+        # Never scroll above the top.
+        self.assertTrue(app._handle_leaderboard_key(curses.KEY_UP))
+        self.assertEqual(app.state.leaderboard_scroll, 0)
+
+        # Tab-switch keys must fall through so the user can leave the view.
+        for key in map(ord, "jnhu"):
+            self.assertFalse(app._handle_leaderboard_key(key))
+
+    def test_refresh_key_fetches_every_window_once(self):
+        client = LeaderboardClient()
+        app = VaccsRunningApp(client, refresh_seconds=0, initial_view="leaderboard")
+
+        self.assertTrue(app._handle_leaderboard_key(ord("r")))
+        for thread in list(app._lb_threads):
+            thread.join(timeout=5)
+
+        self.assertEqual(
+            sorted(client.usage_calls),
+            sorted(window for window, _ in LEADERBOARD_WINDOWS),
+        )
+        self.assertEqual(client.fairshare_calls, 1)
+
+    def test_refresh_is_ignored_while_a_fetch_is_still_running(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="leaderboard")
+        with app._lb_lock:
+            app._lb_windows["24h"]["status"] = "loading"
+
+        self.assertFalse(app._start_leaderboard_refresh())
+
+    def test_draw_leaderboard_ranks_users_and_hides_root(self):
+        client = LeaderboardClient()
+        app = VaccsRunningApp(client, refresh_seconds=0, initial_view="leaderboard")
+        load_leaderboard(app)
+
+        # Account-total (empty login) and root rows never become ranked users.
+        ranked = [row.name for _rank, row in app._leaderboard_snapshot()["24h"]["rows"]]
+        self.assertEqual(sorted(ranked), ["alice", "bob"])
+
+        screen = FakeScreen(height=40, width=140)
+        app._draw(screen)
+
+        written = rendered_text(screen)
+        self.assertIn("alice", written)
+        self.assertIn("bob", written)
+        self.assertIn("USER", written)
+        # Each user's PI group is shown in its own column.
+        self.assertIn("GROUP", written)
+        self.assertIn("pi-x", written)
+        # Fairshare and compact hour counts are rendered.
+        self.assertIn("0.420", written)
+        self.assertIn("700", written)
+
+    def test_usage_leaves_a_blank_row_between_the_menu_and_the_panes(self):
+        client = LeaderboardClient()
+        app = VaccsRunningApp(client, refresh_seconds=0, initial_view="leaderboard")
+        load_leaderboard(app)
+        screen = FakeScreen(height=40, width=140)
+
+        app._draw(screen)
+
+        rows_used = {write[0] for write in screen.writes}
+        self.assertIn(3, rows_used)  # the controls menu row
+        self.assertNotIn(4, rows_used)  # blank separator row above the panes
+        self.assertEqual(min(r for r in rows_used if r >= 5), LEADERBOARD_GRID_TOP)
+
+    def test_draw_leaderboard_group_mode_shows_accounts(self):
+        client = LeaderboardClient()
+        app = VaccsRunningApp(client, refresh_seconds=0, initial_view="leaderboard")
+        app.state.leaderboard_group_mode = True
+        load_leaderboard(app)
+        screen = FakeScreen(height=40, width=140)
+
+        app._draw(screen)
+
+        written = rendered_text(screen)
+        self.assertIn("GROUP", written)
+        self.assertIn("pi-x", written)
+        self.assertNotIn("root", written)
+
+    def test_draw_leaderboard_shows_loading_and_error_panes(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="leaderboard")
+        with app._lb_lock:
+            app._lb_windows["24h"] = {"status": "loading", "usage": [], "error": ""}
+            app._lb_windows["7d"] = {
+                "status": "error",
+                "usage": [],
+                "error": "sreport exploded",
+            }
+            app._lb_windows["30d"] = {"status": "ready", "usage": [], "error": ""}
+        screen = FakeScreen(height=40, width=160)
+
+        app._draw(screen)
+
+        written = rendered_text(screen)
+        self.assertIn("running slurm query", written)
+        self.assertIn("sreport exploded", written)
+        self.assertIn("no usage in this window", written)
+
+    def test_draw_shows_leaderboard_too_small_notice(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="leaderboard")
+        screen = FakeScreen(height=20, width=80)
+
+        app._draw(screen)
+
+        written = rendered_text(screen)
+        self.assertIn("bigger screen", written)
+        self.assertIn(f"{LEADERBOARD_MIN_WIDTH} x {LEADERBOARD_MIN_HEIGHT}", written)
+        self.assertNotIn("USER", written)
+
+    def test_draw_leaderboard_scrolls_and_numbers_ranks_from_offset(self):
+        app = VaccsRunningApp(
+            ScrollLeaderboardClient(30), refresh_seconds=0, initial_view="leaderboard"
+        )
+        load_leaderboard(app)
+        app.state.leaderboard_scroll = 10
+        screen = FakeScreen(height=24, width=120)
+
+        app._draw(screen)
+
+        # 30 users overflow the pane body; scroll=10 makes rank 11 the top row.
+        cells = {write[2].strip() for write in screen.writes}
+        self.assertIn("u10", cells)  # first visible row (rank scroll+1 = 11)
+        self.assertIn("11", cells)  # its rank, numbered from the scroll offset
+        self.assertNotIn("u09", cells)  # rank 10, scrolled above the fold
+        self.assertNotIn("u00", cells)  # rank 1, well above the fold
+
+    def test_draw_leaderboard_clamps_scroll_so_last_row_is_reachable(self):
+        app = VaccsRunningApp(
+            ScrollLeaderboardClient(30), refresh_seconds=0, initial_view="leaderboard"
+        )
+        load_leaderboard(app)
+        # KEY_END parks the scroll at a sentinel; the draw must clamp it so the
+        # last row stays reachable.
+        app._handle_leaderboard_key(curses.KEY_END)
+        screen = FakeScreen(height=24, width=120)
+
+        app._draw(screen)
+
+        self.assertLess(app.state.leaderboard_scroll, 10 ** 9)  # sentinel clamped
+        cells = {write[2].strip() for write in screen.writes}
+        self.assertIn("u29", cells)  # the last user (rank 30) is on screen
+        self.assertIn("30", cells)  # its rank
+
+    def test_paging_keys_move_the_scroll_offset(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="leaderboard")
+
+        self.assertTrue(app._handle_leaderboard_key(curses.KEY_NPAGE))
+        self.assertEqual(app.state.leaderboard_scroll, LEADERBOARD_PAGE)
+        self.assertTrue(app._handle_leaderboard_key(curses.KEY_PPAGE))
+        self.assertEqual(app.state.leaderboard_scroll, 0)
+        # PgUp never scrolls above the top.
+        self.assertTrue(app._handle_leaderboard_key(curses.KEY_PPAGE))
+        self.assertEqual(app.state.leaderboard_scroll, 0)
+
+        app.state.leaderboard_scroll = 5
+        self.assertTrue(app._handle_leaderboard_key(curses.KEY_HOME))
+        self.assertEqual(app.state.leaderboard_scroll, 0)
+        self.assertTrue(app._handle_leaderboard_key(curses.KEY_END))
+        self.assertEqual(app.state.leaderboard_scroll, 10 ** 9)
+
+    def test_wide_ranks_are_not_truncated(self):
+        app = VaccsRunningApp(
+            ScrollLeaderboardClient(1200), refresh_seconds=0, initial_view="leaderboard"
+        )
+        load_leaderboard(app)
+        app._handle_leaderboard_key(curses.KEY_END)
+        screen = FakeScreen(height=24, width=120)
+
+        app._draw(screen)
+
+        # The 1200th rank must render in full, not truncated to "120".
+        cells = {write[2].strip() for write in screen.writes}
+        self.assertIn("1200", cells)
+        self.assertIn("u1199", cells)
+
+    def test_stale_generation_results_are_discarded(self):
+        client = LeaderboardClient()
+        app = VaccsRunningApp(client, refresh_seconds=0, initial_view="leaderboard")
+        load_leaderboard(app)
+
+        # Simulate a newer 'r' press superseding the running generation.
+        with app._lb_lock:
+            app._lb_generation += 1
+            app._lb_windows["24h"] = {"status": "loading", "usage": [], "error": ""}
+            app._lb_fairshare = {}
+        stale = app._lb_generation - 1
+
+        # A leftover thread from the old generation must not clobber the new one.
+        app._fetch_leaderboard_window(stale, "24h")
+        app._fetch_leaderboard_fairshare(stale)
+        with app._lb_lock:
+            self.assertEqual(app._lb_windows["24h"]["status"], "loading")
+            self.assertEqual(app._lb_fairshare, {})
+
+        # A current-generation result is accepted.
+        app._fetch_leaderboard_window(app._lb_generation, "24h")
+        app._fetch_leaderboard_fairshare(app._lb_generation)
+        with app._lb_lock:
+            self.assertEqual(app._lb_windows["24h"]["status"], "ready")
+            self.assertTrue(app._lb_fairshare)
+
+    def _open_find(self, client=None):
+        app = VaccsRunningApp(
+            client or FindLeaderboardClient(),
+            refresh_seconds=0,
+            initial_view="leaderboard",
+        )
+        load_leaderboard(app)
+        self.assertTrue(app._handle_leaderboard_key(ord("f")))
+        self.assertTrue(app.state.leaderboard_filter_editing)
+        return app
+
+    def test_find_filters_rows_by_name_as_you_type(self):
+        app = self._open_find()
+        for ch in "der":
+            self.assertTrue(app._handle_key(None, ord(ch)))
+        self.assertEqual(app.state.leaderboard_filter, "der")
+        names = [row.name for _rank, row in app._leaderboard_snapshot()["24h"]["rows"]]
+        self.assertEqual(names, ["derek"])  # "dgezgin" has no "der" substring
+
+    def test_find_backspace_broadens_the_match(self):
+        app = self._open_find()
+        for ch in "der":
+            app._handle_key(None, ord(ch))
+        app._handle_key(None, curses.KEY_BACKSPACE)  # -> "de"
+        app._handle_key(None, 127)  # -> "d"
+        self.assertEqual(app.state.leaderboard_filter, "d")
+        names = sorted(
+            row.name for _rank, row in app._leaderboard_snapshot()["24h"]["rows"]
+        )
+        self.assertEqual(names, ["derek", "dgezgin"])
+
+    def test_find_is_case_insensitive(self):
+        app = self._open_find()
+        for ch in "ALICE":
+            app._handle_key(None, ord(ch))
+        names = [row.name for _rank, row in app._leaderboard_snapshot()["24h"]["rows"]]
+        self.assertEqual(names, ["alice"])
+
+    def test_typing_in_find_captures_tab_and_quit_keys(self):
+        app = self._open_find()
+        # 'q' must be typed into the query, not quit the app.
+        self.assertTrue(app._handle_key(None, ord("q")))
+        self.assertEqual(app.state.leaderboard_filter, "q")
+        # A tab key ('j') is typed, not a view switch.
+        self.assertTrue(app._handle_key(None, ord("j")))
+        self.assertEqual(app.state.view, "leaderboard")
+        self.assertEqual(app.state.leaderboard_filter, "qj")
+
+    def test_find_enter_keeps_filter_and_esc_clears_it(self):
+        app = self._open_find()
+        for ch in "al":
+            app._handle_key(None, ord(ch))
+        app._handle_key(None, ord("\n"))  # Enter confirms
+        self.assertFalse(app.state.leaderboard_filter_editing)
+        self.assertEqual(app.state.leaderboard_filter, "al")
+        # With the box closed, 'q' quits again.
+        self.assertFalse(app._handle_key(None, ord("q")))
+        # Re-open and Esc clears the filter entirely.
+        app._handle_leaderboard_key(ord("f"))
+        app._handle_key(None, 27)
+        self.assertFalse(app.state.leaderboard_filter_editing)
+        self.assertEqual(app.state.leaderboard_filter, "")
+
+    def test_scrolling_still_works_while_the_find_box_is_open(self):
+        app = self._open_find(ScrollLeaderboardClient(30))
+        app._handle_key(None, curses.KEY_NPAGE)
+        self.assertEqual(app.state.leaderboard_scroll, LEADERBOARD_PAGE)
+        self.assertTrue(app.state.leaderboard_filter_editing)  # still typing
+
+    def test_draw_shows_find_query_and_no_match_message(self):
+        app = VaccsRunningApp(
+            FindLeaderboardClient(), refresh_seconds=0, initial_view="leaderboard"
+        )
+        load_leaderboard(app)
+        app.state.leaderboard_filter_editing = True
+        app.state.leaderboard_filter = "zzz"
+        screen = FakeScreen(height=40, width=140)
+
+        app._draw(screen)
+
+        written = rendered_text(screen)
+        self.assertIn("f find: zzz", written)  # query echoed in the header
+        self.assertIn('no match for "zzz"', written)
+
+    def test_draw_only_shows_matching_rows(self):
+        app = VaccsRunningApp(
+            FindLeaderboardClient(), refresh_seconds=0, initial_view="leaderboard"
+        )
+        load_leaderboard(app)
+        app.state.leaderboard_filter = "derek"
+        screen = FakeScreen(height=40, width=140)
+
+        app._draw(screen)
+
+        written = rendered_text(screen)
+        self.assertIn("derek", written)
+        self.assertNotIn("alice", written)
+        self.assertNotIn("dgezgin", written)
+
+    def test_find_preserves_the_original_rank(self):
+        # u00..u29 rank 1..30 by GPU; u25 sits at rank 26 in the full list.
+        app = VaccsRunningApp(
+            ScrollLeaderboardClient(30), refresh_seconds=0, initial_view="leaderboard"
+        )
+        load_leaderboard(app)
+        app.state.leaderboard_filter = "u25"
+
+        ranked = app._leaderboard_snapshot()["24h"]["rows"]
+        self.assertEqual([(rank, row.name) for rank, row in ranked], [(26, "u25")])
+
+        # It renders with its overall rank (26), not re-numbered to 1.
+        screen = FakeScreen(height=24, width=120)
+        app._draw(screen)
+        cells = {write[2].strip() for write in screen.writes}
+        self.assertIn("u25", cells)
+        self.assertIn("26", cells)
+
+    def test_wide_preserved_rank_is_not_truncated(self):
+        # Filtering to a single deep-ranked user must still size the rank column.
+        app = VaccsRunningApp(
+            ScrollLeaderboardClient(1200), refresh_seconds=0, initial_view="leaderboard"
+        )
+        load_leaderboard(app)
+        app.state.leaderboard_filter = "u1150"  # rank 1151
+        screen = FakeScreen(height=24, width=120)
+
+        app._draw(screen)
+
+        cells = {write[2].strip() for write in screen.writes}
+        self.assertIn("u1150", cells)
+        self.assertIn("1151", cells)
+
+    def test_quit_hint_is_right_aligned_on_every_view(self):
+        for view in ("jobs", "nodes", "history", "leaderboard"):
+            app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view=view)
+            screen = FakeScreen(height=40, width=140)
+            app._draw_header(screen, 140)
+            quit_writes = [w for w in screen.writes if w[2] == "q quit"]
+            self.assertEqual(len(quit_writes), 1, f"{view}: expected exactly one quit hint")
+            y, x, _text, _attr = quit_writes[0]
+            self.assertEqual(y, 3, f"{view}: quit hint on the controls row")
+            # Right-aligned: sits in the right half, near the edge.
+            self.assertGreater(x, 140 // 2, f"{view}: quit hint should be right-aligned")
+            self.assertLessEqual(x + len("q quit"), 140)
 
 
 if __name__ == "__main__":

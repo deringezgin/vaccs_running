@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import datetime
 import getpass
 import os
 import re
@@ -80,6 +81,37 @@ NODE_JOBS_FIELDS = [
 NODE_JOBS_FORMAT = "%i|%u|%T|%M|%C|%b|%j"
 DEFAULT_SQUEUE_STATES = "all"
 SQUEUE_STATE_RE = re.compile(r"[A-Z_]+")
+
+# Leaderboard (usage-per-user) view. sreport AccountUtilizationByUser returns
+# both account-total rows (empty login) and per-user rows in one call, so a
+# single fetch per window feeds both the "by user" and "by group" tables.
+SREPORT_USAGE_FORMAT = "Login,Account,TresName,Used"
+SREPORT_USAGE_REPORT = "AccountUtilizationByUser"
+SSHARE_FAIRSHARE_FORMAT = "User,Account,FairShare"
+# sreport totals TRES named "cpu" and "gres/gpu"; Used is expressed in Hours.
+USAGE_TRES = "cpu,gres/gpu"
+GPU_TRES_NAMES = {"gres/gpu", "gpu"}
+# The root account row is the cluster grand total; never a leaderboard entry.
+ROOT_ACCOUNT = "root"
+# Windows shown as the three usage panes, ordered left -> right.
+# Capped at 30 days because longer sreport scans grow expensive on VACC
+# (a one-year scan takes about a minute).
+LEADERBOARD_WINDOWS = [
+    ("24h", "last 24 hours"),
+    ("7d", "last 7 days"),
+    ("30d", "last 30 days"),
+]
+LEADERBOARD_WINDOW_DELTAS = {
+    "24h": datetime.timedelta(days=1),
+    "7d": datetime.timedelta(days=7),
+    "30d": datetime.timedelta(days=30),
+}
+LEADERBOARD_SORTS = ["gpu", "cpu", "fairshare"]
+LEADERBOARD_SORT_LABELS = {
+    "gpu": "GPU hours",
+    "cpu": "CPU hours",
+    "fairshare": "fairshare",
+}
 
 class SlurmError(RuntimeError):
     pass
@@ -339,6 +371,33 @@ class UserUsage:
     cpus: int
     gpus: int
     memory_mb: int | None = None
+
+
+@dataclass(frozen=True)
+class UsageEntry:
+    """One (login, account) usage record parsed from sreport.
+
+    ``login`` is empty for the account-total row that sreport emits per account.
+    ``cpu_hours`` and ``gpu_hours`` are CPU-hours and GPU-hours over the window.
+    """
+
+    login: str
+    account: str
+    cpu_hours: int
+    gpu_hours: int
+
+
+@dataclass(frozen=True)
+class LeaderboardRow:
+    """A single ranked entry (a user or a group/account) for one window."""
+
+    name: str
+    cpu_hours: int
+    gpu_hours: int
+    fairshare: float | None = None
+    # For user rows: the account/PI group they used most this window. Empty for
+    # group rows (there the name already is the group).
+    group: str = ""
 
 
 @dataclass(frozen=True)
@@ -640,6 +699,51 @@ class SlurmClient:
             free_gpus=free_gpus,
             allocated_gpus=allocated_gpus,
         )
+
+    def fetch_usage_window(
+        self,
+        window: str,
+        now: datetime.datetime | None = None,
+    ) -> list[UsageEntry]:
+        """Per (user, account) CPU-hour and GPU-hour usage over ``window``.
+
+        The 30-day window can take several seconds on VACC, so callers run this
+        off the UI thread.
+        """
+        start = usage_window_start(window, now=now)
+        output = self.runner.run(
+            [
+                "sreport",
+                "-n",
+                "-P",
+                "-t",
+                "Hours",
+                "cluster",
+                SREPORT_USAGE_REPORT,
+                f"Start={start}",
+                "End=now",
+                "-T",
+                USAGE_TRES,
+                f"format={SREPORT_USAGE_FORMAT}",
+            ],
+            timeout=180.0,
+        )
+        return parse_sreport_usage(output)
+
+    def fetch_fairshare(self) -> dict[tuple[str, str], float]:
+        """Current fairshare score keyed by (user, account) association."""
+        output = self.runner.run(
+            [
+                "sshare",
+                "-a",
+                "-h",
+                "-P",
+                "-o",
+                SSHARE_FAIRSHARE_FORMAT,
+            ],
+            timeout=30.0,
+        )
+        return parse_sshare_fairshare(output)
 
 
 def parse_squeue_line(line: str) -> Job:
@@ -1307,6 +1411,218 @@ def human_mb(value: int) -> str:
     if value >= 1024:
         return f"{value / 1024:.0f}G"
     return f"{value}M"
+
+
+def usage_window_start(
+    window: str,
+    now: datetime.datetime | None = None,
+) -> str:
+    """sreport ``Start=`` value for a leaderboard window, e.g. '2026-07-05T09:00:00'."""
+    reference = now or datetime.datetime.now()
+    delta = LEADERBOARD_WINDOW_DELTAS.get(
+        window,
+        LEADERBOARD_WINDOW_DELTAS["24h"],
+    )
+    return (reference - delta).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def parse_sreport_usage(output: str) -> list[UsageEntry]:
+    """Fold sreport's per-TRES rows into one UsageEntry per (login, account)."""
+    totals: dict[tuple[str, str], dict[str, int]] = {}
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("|")
+        if len(parts) < 4:
+            continue
+        login = parts[0].strip()
+        account = parts[1].strip()
+        tres = parts[2].strip().lower()
+        used = parse_int(parts[3].strip())
+        row = totals.setdefault((login, account), {"cpu": 0, "gpu": 0})
+        if tres == "cpu":
+            row["cpu"] += used
+        elif tres in GPU_TRES_NAMES:
+            row["gpu"] += used
+    return [
+        UsageEntry(
+            login=login,
+            account=account,
+            cpu_hours=row["cpu"],
+            gpu_hours=row["gpu"],
+        )
+        for (login, account), row in totals.items()
+    ]
+
+
+def parse_fairshare_value(value: str) -> float | None:
+    stripped = value.strip()
+    if not stripped:
+        return None
+    try:
+        parsed = float(stripped)
+    except ValueError:
+        return None
+    if parsed != parsed or parsed in (float("inf"), float("-inf")):
+        return None
+    return parsed
+
+
+def parse_sshare_fairshare(output: str) -> dict[tuple[str, str], float]:
+    """Map (user, account) -> fairshare from parseable sshare output.
+
+    Account-level rows (empty user) are skipped; sshare indents its columns so
+    every field is stripped before use.
+    """
+    scores: dict[tuple[str, str], float] = {}
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("|")
+        if len(parts) < 3:
+            continue
+        user = parts[0].strip()
+        account = parts[1].strip()
+        if not user:
+            continue
+        fairshare = parse_fairshare_value(parts[2])
+        if fairshare is not None:
+            scores[(user, account)] = fairshare
+    return scores
+
+
+def _user_fairshare(fairshare: dict[tuple[str, str], float]) -> dict[str, float]:
+    """Best (highest) fairshare across each user's account associations."""
+    best: dict[str, float] = {}
+    for (user, _account), score in fairshare.items():
+        if user not in best or score > best[user]:
+            best[user] = score
+    return best
+
+
+def _group_fairshare(fairshare: dict[tuple[str, str], float]) -> dict[str, float]:
+    """Mean fairshare of each account's member users."""
+    members: dict[str, list[float]] = {}
+    for (_user, account), score in fairshare.items():
+        members.setdefault(account, []).append(score)
+    return {
+        account: sum(scores) / len(scores)
+        for account, scores in members.items()
+        if scores
+    }
+
+
+def build_user_leaderboard(
+    usage: Iterable[UsageEntry],
+    fairshare: dict[tuple[str, str], float] | None = None,
+) -> list[LeaderboardRow]:
+    """Per-user rows, summing a user's usage across all their accounts.
+
+    Each row also records the account/PI group the user drew the most on this
+    window (their dominant group), so the UI can show it alongside the user.
+    """
+    per_user: dict[str, dict[str, object]] = {}
+    for entry in usage:
+        if not entry.login:
+            continue
+        row = per_user.setdefault(
+            entry.login, {"cpu": 0, "gpu": 0, "accounts": {}}
+        )
+        row["cpu"] = int(row["cpu"]) + entry.cpu_hours
+        row["gpu"] = int(row["gpu"]) + entry.gpu_hours
+        if entry.account:
+            accounts: dict[str, int] = row["accounts"]  # type: ignore[assignment]
+            accounts[entry.account] = (
+                accounts.get(entry.account, 0)
+                + entry.cpu_hours
+                + entry.gpu_hours
+            )
+    fairshare_by_user = _user_fairshare(fairshare or {})
+    return [
+        LeaderboardRow(
+            name=user,
+            cpu_hours=int(row["cpu"]),
+            gpu_hours=int(row["gpu"]),
+            fairshare=fairshare_by_user.get(user),
+            group=dominant_account(row["accounts"]),  # type: ignore[arg-type]
+        )
+        for user, row in per_user.items()
+    ]
+
+
+def dominant_account(accounts: dict[str, int]) -> str:
+    """The account with the most usage; ties broken alphabetically."""
+    if not accounts:
+        return ""
+    return min(accounts.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+
+
+def build_group_leaderboard(
+    usage: Iterable[UsageEntry],
+    fairshare: dict[tuple[str, str], float] | None = None,
+) -> list[LeaderboardRow]:
+    """Per-account rows, using sreport's account-total rows for usage."""
+    per_group: dict[str, dict[str, int]] = {}
+    for entry in usage:
+        if entry.login:
+            continue
+        if entry.account.lower() == ROOT_ACCOUNT:
+            continue
+        row = per_group.setdefault(entry.account, {"cpu": 0, "gpu": 0})
+        row["cpu"] += entry.cpu_hours
+        row["gpu"] += entry.gpu_hours
+    fairshare_by_group = _group_fairshare(fairshare or {})
+    return [
+        LeaderboardRow(
+            name=account,
+            cpu_hours=row["cpu"],
+            gpu_hours=row["gpu"],
+            fairshare=fairshare_by_group.get(account),
+        )
+        for account, row in per_group.items()
+    ]
+
+
+def sort_leaderboard(
+    rows: Iterable[LeaderboardRow],
+    sort_key: str,
+    descending: bool = True,
+) -> list[LeaderboardRow]:
+    """Rank rows by the chosen metric, name as tie-breaker.
+
+    ``descending`` (the default) puts the biggest values first. Rows without a
+    fairshare score always sort to the bottom, regardless of direction.
+    """
+    sign = -1 if descending else 1
+    if sort_key == "cpu":
+        key = lambda row: (sign * row.cpu_hours, sign * row.gpu_hours, row.name)
+    elif sort_key == "fairshare":
+        key = lambda row: (
+            row.fairshare is None,
+            sign * (row.fairshare if row.fairshare is not None else 0.0),
+            row.name,
+        )
+    else:  # "gpu" and any unknown key
+        key = lambda row: (sign * row.gpu_hours, sign * row.cpu_hours, row.name)
+    return sorted(rows, key=key)
+
+
+def human_hours(value: int) -> str:
+    """Compact hour count for narrow columns: 123, 1.3k, 76k, 1.8M."""
+    # 999_500+ would round up to "1000k", so promote it into the M scale.
+    if value >= 999_500:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 10_000:
+        return f"{value / 1000:.0f}k"
+    if value >= 1_000:
+        return f"{value / 1000:.1f}k"
+    return str(value)
+
+
+def format_fairshare(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.3f}"
 
 
 def summarize_nodes(nodes: Iterable[Node]) -> dict[str, int]:

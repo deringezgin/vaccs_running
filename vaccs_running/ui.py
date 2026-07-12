@@ -3,22 +3,32 @@ from __future__ import annotations
 import curses
 from collections.abc import Callable
 import textwrap
+import threading
 import time
 from dataclasses import dataclass
 
 from .slurm import (
     HISTORY_WINDOWS,
+    LEADERBOARD_SORT_LABELS,
+    LEADERBOARD_SORTS,
+    LEADERBOARD_WINDOWS,
     Job,
     JobFilterChoices,
     JobRecord,
     JobRecordGroup,
+    LeaderboardRow,
     Node,
     SlurmClient,
     SlurmError,
     VACC_PARTITIONS,
+    build_group_leaderboard,
+    build_user_leaderboard,
+    format_fairshare,
     group_job_records,
+    human_hours,
     plural_label,
     record_from_job,
+    sort_leaderboard,
     summarize_job_records,
     summarize_jobs,
     summarize_nodes,
@@ -54,6 +64,19 @@ MUTED_PAIR = 13
 SURFACE_PAIR = 14
 MIN_TERMINAL_WIDTH = 70
 MIN_TERMINAL_HEIGHT = 16
+# The usage view is a row of three side-by-side tables, so it needs a genuine
+# desktop-sized terminal. Below this it shows a "use a computer" notice instead
+# of a cramped, broken layout (e.g. on a phone terminal app).
+LEADERBOARD_MIN_WIDTH = 120
+LEADERBOARD_MIN_HEIGHT = 20
+LEADERBOARD_PAGE = 10
+# Panes start on row 5, leaving row 4 blank between the controls menu and the
+# panes -- matching the gap the jobs/nodes/history tables leave above them.
+LEADERBOARD_GRID_TOP = 5
+# Header shows every sort/order option with the active one highlighted (like the
+# mode toggle). Display order is left-to-right; short labels keep the bar tight.
+LEADERBOARD_SORT_DISPLAY = ["gpu", "cpu", "fairshare"]
+LEADERBOARD_SORT_SHORT = {"cpu": "CPU", "gpu": "GPU", "fairshare": "fairshare"}
 HISTORY_REFRESH_SECONDS = 10.0
 BUSY_JOBS_REFRESH_SECONDS = 5.0
 BUSY_JOBS_REFRESH_THRESHOLD = 50
@@ -108,6 +131,12 @@ class AppState:
     free_gpu_only: bool = False
     jobs_grouped: bool = False
     history_window: str = "24h"
+    leaderboard_group_mode: bool = False
+    leaderboard_sort: str = "gpu"
+    leaderboard_ascending: bool = False
+    leaderboard_scroll: int = 0
+    leaderboard_filter: str = ""
+    leaderboard_filter_editing: bool = False
 
 
 class VaccsRunningApp:
@@ -124,14 +153,36 @@ class VaccsRunningApp:
             job_records=[],
             nodes=[],
             history=[],
-            view=initial_view if initial_view in {"jobs", "history", "nodes"} else "jobs",
+            view=(
+                initial_view
+                if initial_view in {"jobs", "history", "nodes", "leaderboard"}
+                else "jobs"
+            ),
         )
         self.colors_enabled = False
+
+        # Usage data is fetched off the UI thread because the sreport queries
+        # can take several seconds. Each window is fetched by its own daemon
+        # thread; results land in _lb_windows under _lb_lock and the draw loop
+        # picks them up on its next frame. The tab never auto-refreshes -- only
+        # pressing 'r' kicks off a new generation.
+        self._lb_lock = threading.Lock()
+        self._lb_generation = 0
+        self._lb_started = False
+        self._lb_threads: list[threading.Thread] = []
+        self._lb_windows: dict[str, dict[str, object]] = {
+            window: {"status": "idle", "usage": [], "error": ""}
+            for window, _label in LEADERBOARD_WINDOWS
+        }
+        self._lb_fairshare: dict[tuple[str, str], float] = {}
 
     def run(self) -> None:
         curses.wrapper(self._main)
 
     def _active_refresh_seconds(self) -> float:
+        if self.state.view == "leaderboard":
+            # Manual refresh only: usage queries are heavy, so never auto-run them.
+            return 0.0
         if not self.refresh_seconds:
             return self.refresh_seconds
         if self.state.view == "history" and self.refresh_seconds:
@@ -220,6 +271,12 @@ class VaccsRunningApp:
         return curses.COLOR_WHITE
 
     def _refresh_current(self) -> None:
+        if self.state.view == "leaderboard":
+            # First visit kicks off the background load; afterwards the cached
+            # results are kept until the user presses 'r'.
+            self._ensure_leaderboard_loaded()
+            self.state.last_refresh = time.monotonic()
+            return
         if self.state.view == "history":
             message = self._refresh_history()
         elif self.state.view == "nodes":
@@ -254,6 +311,120 @@ class VaccsRunningApp:
             return f"{len(self.state.history)} tasks in {self.state.history_window}"
         except SlurmError as exc:
             return f"history: {exc}"
+
+    # -- Leaderboard background fetching -----------------------------------
+
+    def _ensure_leaderboard_loaded(self) -> None:
+        if not self._lb_started:
+            self._start_leaderboard_refresh()
+
+    def _leaderboard_loading(self) -> bool:
+        with self._lb_lock:
+            return any(
+                window["status"] == "loading"
+                for window in self._lb_windows.values()
+            )
+
+    def _start_leaderboard_refresh(self) -> bool:
+        """Spawn a fetch thread per window. No-op while one is already running."""
+        if self._leaderboard_loading():
+            return False
+        self._lb_started = True
+        with self._lb_lock:
+            self._lb_generation += 1
+            generation = self._lb_generation
+            # Drop the old fairshare so refreshed usage never renders against a
+            # previous generation's scores (or stale scores if sshare later fails).
+            self._lb_fairshare = {}
+            for window, _label in LEADERBOARD_WINDOWS:
+                self._lb_windows[window] = {
+                    "status": "loading",
+                    "usage": [],
+                    "error": "",
+                }
+        self._lb_threads = []
+        for window, _label in LEADERBOARD_WINDOWS:
+            thread = threading.Thread(
+                target=self._fetch_leaderboard_window,
+                args=(generation, window),
+                daemon=True,
+            )
+            thread.start()
+            self._lb_threads.append(thread)
+        fairshare_thread = threading.Thread(
+            target=self._fetch_leaderboard_fairshare,
+            args=(generation,),
+            daemon=True,
+        )
+        fairshare_thread.start()
+        self._lb_threads.append(fairshare_thread)
+        return True
+
+    def _fetch_leaderboard_window(self, generation: int, window: str) -> None:
+        try:
+            usage = self.client.fetch_usage_window(window)
+            result = {"status": "ready", "usage": usage, "error": ""}
+        except SlurmError as exc:
+            result = {"status": "error", "usage": [], "error": str(exc)}
+        except Exception as exc:  # never let a daemon thread die silently
+            result = {"status": "error", "usage": [], "error": str(exc)}
+        with self._lb_lock:
+            if generation == self._lb_generation:
+                self._lb_windows[window] = result
+
+    def _fetch_leaderboard_fairshare(self, generation: int) -> None:
+        try:
+            fairshare = self.client.fetch_fairshare()
+        except Exception:
+            fairshare = None
+        with self._lb_lock:
+            if generation == self._lb_generation and fairshare is not None:
+                self._lb_fairshare = fairshare
+
+    def _leaderboard_snapshot(self) -> dict[str, dict[str, object]]:
+        """Build the ranked rows for each window from the cached raw data."""
+        with self._lb_lock:
+            windows = {
+                window: dict(info) for window, info in self._lb_windows.items()
+            }
+            fairshare = dict(self._lb_fairshare)
+        build = (
+            build_group_leaderboard
+            if self.state.leaderboard_group_mode
+            else build_user_leaderboard
+        )
+        needle = self.state.leaderboard_filter.strip().lower()
+        snapshot: dict[str, dict[str, object]] = {}
+        for window, _label in LEADERBOARD_WINDOWS:
+            info = windows.get(
+                window, {"status": "idle", "usage": [], "error": ""}
+            )
+            # Rows are (rank, row): the rank is the 1-based position in the full
+            # sorted list and is assigned BEFORE filtering, so a filtered row
+            # keeps its overall standing (e.g. the 32nd user still shows 32).
+            rows: list[tuple[int, LeaderboardRow]] = []
+            if info["status"] == "ready":
+                ranked = list(
+                    enumerate(
+                        sort_leaderboard(
+                            build(info["usage"], fairshare),
+                            self.state.leaderboard_sort,
+                            descending=not self.state.leaderboard_ascending,
+                        ),
+                        start=1,
+                    )
+                )
+                if needle:
+                    ranked = [
+                        pair for pair in ranked if needle in pair[1].name.lower()
+                    ]
+                rows = ranked
+            snapshot[window] = {
+                "status": info["status"],
+                "rows": rows,
+                "error": info.get("error", ""),
+            }
+        return snapshot
 
     def _visible_jobs(self) -> list[Job]:
         if self._jobs_filter_active():
@@ -311,6 +482,8 @@ class VaccsRunningApp:
         return visible
 
     def _visible_count(self) -> int:
+        if self.state.view == "leaderboard":
+            return 0
         if self.state.view == "nodes":
             return len(self._visible_nodes())
         if self.state.view == "history":
@@ -320,8 +493,15 @@ class VaccsRunningApp:
         return len(self._visible_jobs())
 
     def _handle_key(self, stdscr: curses.window, key: int) -> bool:
+        # While the Usage find box is open, every keystroke edits the query
+        # (so typing 'q', 'j', etc. filters instead of quitting/switching).
+        if self.state.view == "leaderboard" and self.state.leaderboard_filter_editing:
+            self._handle_leaderboard_filter_key(key)
+            return True
         if key in (ord("q"), 27):
             return False
+        if self.state.view == "leaderboard" and self._handle_leaderboard_key(key):
+            return True
         if key == curses.KEY_DOWN:
             self.state.selected += 1
         elif key in (curses.KEY_UP, ord("k")):
@@ -344,6 +524,8 @@ class VaccsRunningApp:
             self._switch_view("history")
         elif key == ord("j"):
             self._switch_view("jobs")
+        elif key == ord("u"):
+            self._switch_view("leaderboard")
         elif key == ord("g"):
             if self.state.view == "nodes":
                 enabled = not self.state.gpu_nodes_only
@@ -373,7 +555,7 @@ class VaccsRunningApp:
             elif self.state.view == "jobs":
                 self._show_jobs_filter(stdscr)
             elif self.state.view == "history":
-                self._show_history_filter(stdscr)
+                self._cycle_history_window()
         elif key == ord("d"):
             if self.state.view in {"jobs", "nodes"}:
                 self._show_detail(stdscr)
@@ -387,6 +569,103 @@ class VaccsRunningApp:
         self._clamp_selection()
         return True
 
+    def _handle_leaderboard_key(self, key: int) -> bool:
+        """Handle leaderboard-only keys; return False so tab keys still switch views."""
+        if key == ord("r"):
+            if self._start_leaderboard_refresh():
+                self.state.message = "usage refreshing"
+            else:
+                self.state.message = "usage still loading"
+            return True
+        if key == ord("m"):
+            self.state.leaderboard_group_mode = not self.state.leaderboard_group_mode
+            self.state.leaderboard_scroll = 0
+            mode = "group" if self.state.leaderboard_group_mode else "user"
+            self.state.message = f"usage mode: {mode}"
+            return True
+        if key == ord("f"):
+            self.state.leaderboard_filter_editing = True
+            self.state.message = "usage find: type to filter by name"
+            return True
+        if key == ord("s"):
+            self._cycle_leaderboard_sort()
+            return True
+        if key == ord("o"):
+            self.state.leaderboard_ascending = not self.state.leaderboard_ascending
+            self.state.leaderboard_scroll = 0
+            order = "ascending" if self.state.leaderboard_ascending else "descending"
+            self.state.message = f"usage order: {order}"
+            return True
+        if key == curses.KEY_DOWN:
+            self.state.leaderboard_scroll += 1
+            return True
+        if key == curses.KEY_UP:
+            self.state.leaderboard_scroll = max(0, self.state.leaderboard_scroll - 1)
+            return True
+        if key == curses.KEY_NPAGE:
+            self.state.leaderboard_scroll += LEADERBOARD_PAGE
+            return True
+        if key == curses.KEY_PPAGE:
+            self.state.leaderboard_scroll = max(
+                0, self.state.leaderboard_scroll - LEADERBOARD_PAGE
+            )
+            return True
+        if key == curses.KEY_HOME:
+            self.state.leaderboard_scroll = 0
+            return True
+        if key == curses.KEY_END:
+            # A very large value; _draw_leaderboard clamps it to the last page.
+            self.state.leaderboard_scroll = 10 ** 9
+            return True
+        return False
+
+    def _handle_leaderboard_filter_key(self, key: int) -> None:
+        """Edit the live find query. Rows filter as each character is typed."""
+        if key in (curses.KEY_ENTER, ord("\n"), ord("\r")):
+            self.state.leaderboard_filter_editing = False  # keep the filter
+            return
+        if key == 27:  # Esc: clear the filter and close the find box
+            self.state.leaderboard_filter_editing = False
+            self.state.leaderboard_filter = ""
+            self.state.leaderboard_scroll = 0
+            return
+        if key in (
+            curses.KEY_DOWN,
+            curses.KEY_UP,
+            curses.KEY_NPAGE,
+            curses.KEY_PPAGE,
+            curses.KEY_HOME,
+            curses.KEY_END,
+        ):
+            # Let the user scroll the filtered results without leaving the box.
+            self._handle_leaderboard_key(key)
+            return
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            self.state.leaderboard_filter = self.state.leaderboard_filter[:-1]
+            self.state.leaderboard_scroll = 0
+            return
+        if key == 21:  # Ctrl-U clears the query
+            self.state.leaderboard_filter = ""
+            self.state.leaderboard_scroll = 0
+            return
+        if 32 <= key <= 126:
+            self.state.leaderboard_filter += chr(key)
+            self.state.leaderboard_scroll = 0
+
+    def _cycle_leaderboard_sort(self) -> None:
+        try:
+            index = LEADERBOARD_SORTS.index(self.state.leaderboard_sort)
+        except ValueError:
+            index = -1
+        self.state.leaderboard_sort = LEADERBOARD_SORTS[
+            (index + 1) % len(LEADERBOARD_SORTS)
+        ]
+        self.state.leaderboard_scroll = 0
+        label = LEADERBOARD_SORT_LABELS.get(
+            self.state.leaderboard_sort, self.state.leaderboard_sort
+        )
+        self.state.message = f"usage sorted by {label}"
+
     def _set_history_window(self, window: str) -> None:
         if window not in HISTORY_WINDOWS:
             return
@@ -395,6 +674,14 @@ class VaccsRunningApp:
         self.state.scroll = 0
         self._refresh_history()
         self._clamp_selection()
+
+    def _cycle_history_window(self) -> None:
+        windows = [window for window, _label in HISTORY_FILTER_OPTIONS]
+        try:
+            index = windows.index(self.state.history_window)
+        except ValueError:
+            index = -1
+        self._set_history_window(windows[(index + 1) % len(windows)])
 
     def _page_size(self, stdscr: curses.window) -> int:
         height, _ = stdscr.getmaxyx()
@@ -470,6 +757,15 @@ class VaccsRunningApp:
     def _draw(self, stdscr: curses.window) -> None:
         stdscr.erase()
         height, width = stdscr.getmaxyx()
+        if self.state.view == "leaderboard":
+            if leaderboard_too_small(width, height):
+                self._draw_leaderboard_too_small(stdscr, width, height)
+                stdscr.refresh()
+                return
+            self._draw_header(stdscr, width)
+            self._draw_leaderboard(stdscr, height, width)
+            stdscr.refresh()
+            return
         if terminal_too_small(width, height):
             self._draw_terminal_too_small(stdscr, width, height)
             stdscr.refresh()
@@ -522,6 +818,184 @@ class VaccsRunningApp:
             x = max(0, (width - len(line)) // 2)
             self._addstr(stdscr, top + offset, x, line, self._pair(MUTED_PAIR) | attr)
 
+    def _draw_leaderboard_too_small(
+        self,
+        stdscr: curses.window,
+        width: int,
+        height: int,
+    ) -> None:
+        lines = [
+            ("The Usage view needs a bigger screen.", curses.A_BOLD),
+            ("", 0),
+            ("It is a desktop / laptop view -- phone", 0),
+            ("terminals are too narrow to show it.", 0),
+            ("", 0),
+            (f"Current size:  {width} x {height}", curses.A_BOLD),
+            (
+                f"Needed:        {LEADERBOARD_MIN_WIDTH} x {LEADERBOARD_MIN_HEIGHT}",
+                curses.A_BOLD,
+            ),
+            ("", 0),
+            ("j n h  other views      q  quit", 0),
+        ]
+        top = max(0, (height - len(lines)) // 2)
+        for offset, (line, attr) in enumerate(lines):
+            if not line:
+                continue
+            x = max(0, (width - len(line)) // 2)
+            self._addstr(stdscr, top + offset, x, line, self._pair(MUTED_PAIR) | attr)
+
+    def _draw_leaderboard(
+        self,
+        stdscr: curses.window,
+        height: int,
+        width: int,
+    ) -> None:
+        snapshot = self._leaderboard_snapshot()
+        grid_top = LEADERBOARD_GRID_TOP
+        grid_height = max(0, height - grid_top)
+        # One row of side-by-side panes, one column per window.
+        rows, cols = 1, max(1, len(LEADERBOARD_WINDOWS))
+        pane_height = grid_height // rows
+        pane_width = width // cols
+
+        # Clamp the shared scroll so the deepest pane's last row stays reachable.
+        body_capacity = max(1, pane_height - 3)
+        longest = max((len(info["rows"]) for info in snapshot.values()), default=0)
+        # Size the rank column for the largest rank actually shown (ranks are
+        # preserved through filtering, so they can exceed the visible row count).
+        ranks = [rank for info in snapshot.values() for rank, _ in info["rows"]]
+        max_rank = max(ranks) if ranks else 1
+        max_scroll = max(0, longest - body_capacity)
+        self.state.leaderboard_scroll = max(
+            0, min(self.state.leaderboard_scroll, max_scroll)
+        )
+        scroll = self.state.leaderboard_scroll
+
+        for index, (window, label) in enumerate(LEADERBOARD_WINDOWS):
+            grid_row = index // cols
+            grid_col = index % cols
+            pane_top = grid_top + grid_row * pane_height
+            pane_left = grid_col * pane_width
+            # Right column and bottom row stretch to fill any integer remainder.
+            this_width = width - pane_left if grid_col == cols - 1 else pane_width
+            this_height = (
+                height - pane_top if grid_row == rows - 1 else pane_height
+            )
+            self._draw_leaderboard_pane(
+                stdscr,
+                pane_top,
+                pane_left,
+                this_height,
+                this_width,
+                label,
+                snapshot[window],
+                scroll,
+                max_rank,
+            )
+
+    def _draw_leaderboard_pane(
+        self,
+        stdscr: curses.window,
+        top: int,
+        left: int,
+        height: int,
+        width: int,
+        label: str,
+        info: dict[str, object],
+        scroll: int,
+        max_rank: int = 1,
+    ) -> None:
+        status = str(info["status"])
+        rows: list[tuple[int, LeaderboardRow]] = info["rows"]  # type: ignore[assignment]
+        suffix = {
+            "ready": f"{len(rows)}",
+            "loading": "loading...",
+            "error": "error",
+            "idle": "idle",
+        }.get(status, status)
+        self._draw_box(stdscr, top, left, height, width, f" {label} - {suffix} ")
+        inner_left = left + 2
+        inner_width = max(0, width - 4)
+        if inner_width <= 0 or height < 4:
+            return
+
+        if status == "loading":
+            self._addstr(
+                stdscr, top + 2, inner_left, "running slurm query..."[:inner_width],
+                self._pair(2),
+            )
+            return
+        if status == "error":
+            message = str(info["error"]) or "query failed"
+            self._addstr(stdscr, top + 2, inner_left, message[:inner_width], self._pair(4))
+            return
+        if status == "idle":
+            self._addstr(
+                stdscr, top + 2, inner_left, "press r to load"[:inner_width],
+                self._pair(MUTED_PAIR),
+            )
+            return
+        if not rows:
+            if self.state.leaderboard_filter:
+                empty = f'no match for "{self.state.leaderboard_filter}"'
+            else:
+                empty = "no usage in this window"
+            self._addstr(
+                stdscr, top + 2, inner_left, empty[:inner_width],
+                self._pair(MUTED_PAIR),
+            )
+            return
+
+        user_mode = not self.state.leaderboard_group_mode
+        entity = "USER" if user_mode else "GROUP"
+        # Show each user's PI group only in user mode (group rows are groups).
+        columns = leaderboard_columns(inner_width, entity, max_rank, group_col=user_mode)
+        self._draw_leaderboard_row(
+            stdscr,
+            top + 1,
+            inner_left,
+            columns,
+            [label for _key, label, _w, _a in columns],
+            self._pair(MUTED_PAIR) | curses.A_BOLD,
+        )
+        body_capacity = max(0, height - 3)
+        for offset, (rank, row) in enumerate(rows[scroll : scroll + body_capacity]):
+            cells = {
+                "rank": str(rank),
+                "name": row.name,
+                "group": row.group or "-",
+                "cpu": human_hours(row.cpu_hours),
+                "gpu": human_hours(row.gpu_hours),
+                "fs": format_fairshare(row.fairshare),
+            }
+            self._draw_leaderboard_row(
+                stdscr,
+                top + 2 + offset,
+                inner_left,
+                columns,
+                [cells[key] for key, _label, _w, _a in columns],
+                self._pair(MUTED_PAIR),
+            )
+
+    def _draw_leaderboard_row(
+        self,
+        stdscr: curses.window,
+        y: int,
+        x: int,
+        columns: list[tuple[str, str, int, str]],
+        values: list[str],
+        attr: int,
+    ) -> None:
+        cursor = x
+        for (_key, _label, col_width, align), value in zip(columns, values):
+            if col_width <= 0:
+                continue
+            text = value[:col_width]
+            text = text.rjust(col_width) if align == "r" else text.ljust(col_width)
+            self._addstr(stdscr, y, cursor, text, attr)
+            cursor += col_width + 1
+
     def _draw_header(self, stdscr: curses.window, width: int) -> None:
         title = " VACC's Running? "
         right = time.strftime("%H:%M:%S")
@@ -532,6 +1006,7 @@ class VaccsRunningApp:
             ("jobs", " j Jobs "),
             ("nodes", " n Nodes "),
             ("history", " h History "),
+            ("leaderboard", " u Usage "),
         ]:
             attr = (
                 self._pair(ACTIVE_TAB_PAIR) | curses.A_BOLD
@@ -579,13 +1054,55 @@ class VaccsRunningApp:
             x += len(" p peek ") + 1
             self._addstr(stdscr, 3, x, " i usage ", self._pair(MUTED_PAIR))
             x += len(" i usage ") + 1
-            self._addstr(stdscr, 3, x, " q quit", self._pair(MUTED_PAIR))
         elif self.state.view == "history":
             x = 1
-            filter_text = f" f filter: {history_window_short_label(self.state.history_window)} "
-            self._addstr(stdscr, 3, x, filter_text, self._pair(MUTED_PAIR))
-            x += len(filter_text) + 1
-            self._addstr(stdscr, 3, x, " q quit", self._pair(MUTED_PAIR))
+            # " f filter: 1h / 3h / 24h / 3d / 7d " with the active window highlighted.
+            x = self._draw_header_choice(
+                stdscr,
+                x,
+                " f filter: ",
+                [(window, window) for window, _label in HISTORY_FILTER_OPTIONS],
+                self.state.history_window,
+            )
+        elif self.state.view == "leaderboard":
+            x = 1
+            # Each control lists every option with the active one highlighted.
+            # (Pressing 'r' still refreshes; it is intentionally not advertised.)
+            x = self._draw_header_choice(
+                stdscr,
+                x,
+                " m mode: ",
+                [("user", "user"), ("group", "group")],
+                "group" if self.state.leaderboard_group_mode else "user",
+            )
+            if self.state.leaderboard_filter_editing:
+                find_text = f" f find: {self.state.leaderboard_filter}_ "
+                find_attr = ACTIVE_TAB_PAIR
+            elif self.state.leaderboard_filter:
+                find_text = f" f find: {self.state.leaderboard_filter} "
+                find_attr = ACTIVE_TAB_PAIR
+            else:
+                find_text = " f find "
+                find_attr = MUTED_PAIR
+            self._addstr(stdscr, 3, x, find_text, self._pair(find_attr))
+            x += len(find_text) + 1
+            x = self._draw_header_choice(
+                stdscr,
+                x,
+                " s sort: ",
+                [
+                    (key, LEADERBOARD_SORT_SHORT.get(key, key))
+                    for key in LEADERBOARD_SORT_DISPLAY
+                ],
+                self.state.leaderboard_sort,
+            )
+            x = self._draw_header_choice(
+                stdscr,
+                x,
+                " o order: ",
+                [("ascending", "ascending"), ("descending", "descending")],
+                "ascending" if self.state.leaderboard_ascending else "descending",
+            )
         else:
             x = 1
             group_text = " g group "
@@ -627,7 +1144,43 @@ class VaccsRunningApp:
                 x += len(partition_text) + 1
             self._addstr(stdscr, 3, x, " d detail ", self._pair(MUTED_PAIR))
             x += len(" d detail ") + 1
-            self._addstr(stdscr, 3, x, " q quit", self._pair(MUTED_PAIR))
+
+        # Every view carries a right-aligned quit hint on the controls row.
+        quit_label = "q quit"
+        self._addstr(
+            stdscr,
+            3,
+            max(x, width - len(quit_label) - 2),
+            quit_label,
+            self._pair(MUTED_PAIR),
+        )
+
+    def _draw_header_choice(
+        self,
+        stdscr: curses.window,
+        x: int,
+        prefix: str,
+        options: list[tuple[str, str]],
+        active: str,
+    ) -> int:
+        """Draw ``prefix`` then ``a/b/c`` options, highlighting the active one.
+
+        Returns the new x cursor (with a trailing gap) for the next segment.
+        """
+        self._addstr(stdscr, 3, x, prefix, self._pair(MUTED_PAIR))
+        x += len(prefix)
+        for index, (value, label) in enumerate(options):
+            if index:
+                self._addstr(stdscr, 3, x, " / ", self._pair(MUTED_PAIR))
+                x += 3
+            attr = (
+                self._pair(ACTIVE_TAB_PAIR) | curses.A_BOLD
+                if value == active
+                else self._pair(MUTED_PAIR)
+            )
+            self._addstr(stdscr, 3, x, label, attr)
+            x += len(label)
+        return x + 2  # trailing space + gap before the next segment
 
     def _draw_jobs_table(
         self,
@@ -1972,48 +2525,6 @@ class VaccsRunningApp:
         finally:
             safe_curs_set(0)
 
-    def _show_history_filter(self, stdscr: curses.window) -> None:
-        current_windows = [window for window, _ in HISTORY_FILTER_OPTIONS]
-        selected = max(0, current_windows.index(self.state.history_window))
-        height, width = stdscr.getmaxyx()
-        footer = " up/down select  enter apply  q close "
-        content_width = max(
-            len("history filter") + 4,
-            len(footer),
-            *(len(label) + len(window) + 6 for window, label in HISTORY_FILTER_OPTIONS),
-        )
-        box_width = min(max(36, content_width + 4), max(20, width - 8))
-        box_height = len(HISTORY_FILTER_OPTIONS) + 4
-        top = max(1, (height - box_height) // 2)
-        left = max(1, (width - box_width) // 2)
-        win = curses.newwin(box_height, box_width, top, left)
-        win.keypad(True)
-        win.nodelay(False)
-
-        while True:
-            win.erase()
-            win.border()
-            self._addstr(win, 0, 2, " history filter ", self._pair(6) | curses.A_BOLD)
-            for row, (window, label) in enumerate(HISTORY_FILTER_OPTIONS, start=2):
-                marker = ">" if row - 2 == selected else " "
-                current = "*" if window == self.state.history_window else " "
-                text = f"{marker} {label:<14} {window:>3} {current}"
-                attr = self._pair(ACTIVE_TAB_PAIR) | curses.A_BOLD if row - 2 == selected else self._pair(MUTED_PAIR)
-                self._addstr(win, row, 2, text[: box_width - 4], attr)
-            self._addstr(win, box_height - 1, 2, footer[: box_width - 4], self._pair(5))
-            win.refresh()
-
-            key = win.getch()
-            if key in (ord("q"), 27, ord("f")):
-                return
-            if key in (ord("\n"), curses.KEY_ENTER):
-                self._set_history_window(HISTORY_FILTER_OPTIONS[selected][0])
-                return
-            if key in (curses.KEY_DOWN, ord("j")):
-                selected = min(len(HISTORY_FILTER_OPTIONS) - 1, selected + 1)
-            elif key in (curses.KEY_UP, ord("k")):
-                selected = max(0, selected - 1)
-
     def _popup_command(
         self,
         stdscr: curses.window,
@@ -2228,8 +2739,61 @@ def terminal_too_small(width: int, height: int) -> bool:
     return width < MIN_TERMINAL_WIDTH or height < MIN_TERMINAL_HEIGHT
 
 
-def history_window_short_label(window: str) -> str:
-    return window
+def leaderboard_too_small(width: int, height: int) -> bool:
+    return width < LEADERBOARD_MIN_WIDTH or height < LEADERBOARD_MIN_HEIGHT
+
+
+def leaderboard_columns(
+    inner_width: int,
+    entity_label: str,
+    max_rank: int = 1,
+    group_col: bool = False,
+) -> list[tuple[str, str, int, str]]:
+    """Columns for one leaderboard pane, given its usable inner width.
+
+    Returns ``(key, label, width, align)`` tuples. The name (and, in user mode,
+    GROUP) columns flex to fill the remaining space. As the pane narrows, the
+    fairshare column is dropped first, then GROUP, so rank/name/cpu/gpu always
+    stay legible. The rank column widens to fit ``max_rank`` so four-plus digit
+    ranks are never truncated.
+    """
+    rank_w = max(3, len(str(max(1, max_rank))))
+    cpu_w, gpu_w, fs_w = 7, 6, 6
+    name_min = 6
+
+    # Widest layout first; drop FS, then GROUP, as the width shrinks.
+    if group_col:
+        candidates = [(True, True), (True, False), (False, False)]
+    else:
+        candidates = [(False, True), (False, False)]
+
+    for with_group, with_fs in candidates:
+        flex = 2 if with_group else 1  # name (+ group)
+        fixed = rank_w + cpu_w + gpu_w + (fs_w if with_fs else 0)
+        # rank, name, cpu, gpu are always present (4); add group and/or fs.
+        ncols = 4 + (1 if with_group else 0) + (1 if with_fs else 0)
+        remaining = inner_width - fixed - (ncols - 1)
+        if remaining < name_min * flex:
+            continue
+        base = remaining // flex
+        name_w = base
+        group_w = remaining - base  # remainder goes to GROUP
+        cols = [("rank", "#", rank_w, "r"), ("name", entity_label, name_w, "l")]
+        if with_group:
+            cols.append(("group", "GROUP", group_w, "l"))
+        cols += [("cpu", "CPUh", cpu_w, "r"), ("gpu", "GPUh", gpu_w, "r")]
+        if with_fs:
+            cols.append(("fs", "FS", fs_w, "r"))
+        return cols
+
+    # Ultra-narrow fallback: rank/name/cpu/gpu with the name squeezed down.
+    name_w = max(4, inner_width - rank_w - cpu_w - gpu_w - 3)
+    return [
+        ("rank", "#", rank_w, "r"),
+        ("name", entity_label, name_w, "l"),
+        ("cpu", "CPUh", cpu_w, "r"),
+        ("gpu", "GPUh", gpu_w, "r"),
+    ]
 
 
 def job_state_filter_label(states: str) -> str:

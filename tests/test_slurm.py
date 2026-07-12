@@ -1,31 +1,47 @@
 import unittest
 
+import datetime
+
 from vaccs_running.slurm import (
     FILTER_CHOICES_FORMAT,
     SACCT_FORMAT,
     NODE_JOBS_FORMAT,
     SQUEUE_FORMAT,
+    SREPORT_USAGE_FORMAT,
+    SSHARE_FAIRSHARE_FORMAT,
+    USAGE_TRES,
+    LeaderboardRow,
     SlurmClient,
+    UsageEntry,
     VACC_PARTITIONS,
     aggregate_user_usage,
+    build_group_leaderboard,
+    build_user_leaderboard,
+    format_fairshare,
     format_node_jobs,
     format_user_usage,
     free_gpu_count,
+    human_hours,
     stranded_gpu_count,
     group_job_records,
     group_jobs,
     history_start,
     parse_sacct_line,
+    parse_fairshare_value,
     parse_node_job_line,
     parse_scontrol_nodes,
     parse_scontrol_job_usage,
+    parse_sreport_usage,
+    parse_sshare_fairshare,
     parse_squeue_line,
     parse_elapsed_seconds,
     parse_gpu_count,
     parse_memory_mb,
     parse_tres_value,
     normalize_squeue_states,
+    sort_leaderboard,
     summarize_jobs,
+    usage_window_start,
 )
 
 
@@ -951,6 +967,222 @@ JobId=4414192 ArrayJobId=4413548 ArrayTaskId=214 JobName=ae-pert-cand
             "64G",
         )
         self.assertEqual(parse_tres_value("cpu=4,node=1", "mem"), "")
+
+
+# Real sreport AccountUtilizationByUser output: account-total rows have an empty
+# Login field, per-user rows carry a Login, and each account emits one row per
+# TRES. Used values are in Hours.
+SREPORT_SAMPLE = "\n".join(
+    [
+        "|root|cpu|1770704",
+        "|root|gres/gpu|14336",
+        "|pi-aelledge|cpu|75782",
+        "|pi-aelledge|gres/gpu|811",
+        "bhimberg|pi-aelledge|cpu|75782",
+        "bhimberg|pi-aelledge|gres/gpu|811",
+        "|pi-alwoodwa|cpu|1601",
+        "|pi-alwoodwa|gres/gpu|0",
+        "jstonge1|pi-alwoodwa|cpu|1211",
+        "jstonge1|pi-alwoodwa|gres/gpu|0",
+        "mvarnold|pi-alwoodwa|cpu|391",
+        "mvarnold|pi-alwoodwa|gres/gpu|0",
+    ]
+)
+
+# Real 3-column sshare output: account rows have an empty user and no fairshare,
+# and sshare indents the Account column even in parseable mode.
+SSHARE_SAMPLE = "\n".join(
+    [
+        "|root|",
+        "root| root|1.000000",
+        "| pi-alwoodwa|",
+        "jstonge1|  pi-alwoodwa|0.812345",
+        "mvarnold|  pi-alwoodwa|0.912345",
+        "| pi-aelledge|",
+        "bhimberg|  pi-aelledge|0.123456",
+    ]
+)
+
+
+class LeaderboardParsingTests(unittest.TestCase):
+    def test_parse_sreport_usage_folds_cpu_and_gpu_per_association(self):
+        entries = parse_sreport_usage(SREPORT_SAMPLE)
+        by_key = {(e.login, e.account): e for e in entries}
+
+        self.assertEqual(
+            by_key[("bhimberg", "pi-aelledge")],
+            UsageEntry("bhimberg", "pi-aelledge", 75782, 811),
+        )
+        self.assertEqual(
+            by_key[("", "pi-alwoodwa")],
+            UsageEntry("", "pi-alwoodwa", 1601, 0),
+        )
+        self.assertEqual(
+            by_key[("jstonge1", "pi-alwoodwa")],
+            UsageEntry("jstonge1", "pi-alwoodwa", 1211, 0),
+        )
+
+    def test_parse_sreport_usage_ignores_blank_and_short_lines(self):
+        self.assertEqual(parse_sreport_usage(""), [])
+        self.assertEqual(parse_sreport_usage("\n  \nbad|line\n"), [])
+
+    def test_parse_sshare_skips_account_rows_and_strips_indent(self):
+        scores = parse_sshare_fairshare(SSHARE_SAMPLE)
+
+        self.assertEqual(
+            scores,
+            {
+                ("root", "root"): 1.0,
+                ("jstonge1", "pi-alwoodwa"): 0.812345,
+                ("mvarnold", "pi-alwoodwa"): 0.912345,
+                ("bhimberg", "pi-aelledge"): 0.123456,
+            },
+        )
+
+    def test_parse_fairshare_value_handles_blanks_and_inf(self):
+        self.assertIsNone(parse_fairshare_value(""))
+        self.assertIsNone(parse_fairshare_value("inf"))
+        self.assertIsNone(parse_fairshare_value("nonsense"))
+        self.assertEqual(parse_fairshare_value(" 0.5 "), 0.5)
+
+    def test_build_user_leaderboard_sums_usage_across_accounts(self):
+        usage = [
+            UsageEntry("", "pi-a", 500, 5),  # account total, ignored for users
+            UsageEntry("alice", "pi-a", 300, 4),
+            UsageEntry("alice", "pi-b", 100, 1),
+            UsageEntry("bob", "pi-a", 200, 0),
+        ]
+        fairshare = {("alice", "pi-a"): 0.4, ("alice", "pi-b"): 0.9, ("bob", "pi-a"): 0.2}
+        rows = {r.name: r for r in build_user_leaderboard(usage, fairshare)}
+
+        self.assertEqual(rows["alice"].cpu_hours, 400)
+        self.assertEqual(rows["alice"].gpu_hours, 5)
+        # Fairshare is the best (max) across a user's associations.
+        self.assertEqual(rows["alice"].fairshare, 0.9)
+        self.assertEqual(rows["bob"].cpu_hours, 200)
+        self.assertNotIn("", rows)
+        # The group column shows the account each user drew on most.
+        self.assertEqual(rows["alice"].group, "pi-a")  # 304 combined vs pi-b's 101
+        self.assertEqual(rows["bob"].group, "pi-a")
+
+    def test_build_user_leaderboard_group_is_the_most_used_account(self):
+        usage = [
+            UsageEntry("dana", "pi-a", 100, 0),
+            UsageEntry("dana", "pi-b", 500, 10),  # clearly her dominant account
+        ]
+        rows = {r.name: r for r in build_user_leaderboard(usage, {})}
+        self.assertEqual(rows["dana"].group, "pi-b")
+
+    def test_build_user_leaderboard_missing_fairshare_is_none(self):
+        rows = build_user_leaderboard([UsageEntry("carol", "pi-a", 10, 0)], {})
+        self.assertIsNone(rows[0].fairshare)
+
+    def test_build_group_leaderboard_uses_account_rows_and_drops_root(self):
+        entries = parse_sreport_usage(SREPORT_SAMPLE)
+        fairshare = parse_sshare_fairshare(SSHARE_SAMPLE)
+        rows = {r.name: r for r in build_group_leaderboard(entries, fairshare)}
+
+        self.assertNotIn("root", rows)
+        self.assertEqual(rows["pi-alwoodwa"].cpu_hours, 1601)
+        self.assertEqual(rows["pi-aelledge"].gpu_hours, 811)
+        # Group fairshare is the mean of member users' scores.
+        self.assertAlmostEqual(
+            rows["pi-alwoodwa"].fairshare, (0.812345 + 0.912345) / 2
+        )
+        self.assertAlmostEqual(rows["pi-aelledge"].fairshare, 0.123456)
+
+    def test_sort_leaderboard_orders_by_requested_metric_descending(self):
+        rows = [
+            LeaderboardRow("a", cpu_hours=10, gpu_hours=1, fairshare=0.2),
+            LeaderboardRow("b", cpu_hours=5, gpu_hours=9, fairshare=0.8),
+            LeaderboardRow("c", cpu_hours=20, gpu_hours=0, fairshare=None),
+        ]
+        self.assertEqual([r.name for r in sort_leaderboard(rows, "gpu")], ["b", "a", "c"])
+        self.assertEqual([r.name for r in sort_leaderboard(rows, "cpu")], ["c", "a", "b"])
+        # None fairshare sorts last.
+        self.assertEqual(
+            [r.name for r in sort_leaderboard(rows, "fairshare")], ["b", "a", "c"]
+        )
+
+    def test_sort_leaderboard_ascending_reverses_the_metric(self):
+        rows = [
+            LeaderboardRow("a", cpu_hours=10, gpu_hours=1, fairshare=0.2),
+            LeaderboardRow("b", cpu_hours=5, gpu_hours=9, fairshare=0.8),
+            LeaderboardRow("c", cpu_hours=20, gpu_hours=0, fairshare=None),
+        ]
+        self.assertEqual(
+            [r.name for r in sort_leaderboard(rows, "gpu", descending=False)],
+            ["c", "a", "b"],
+        )
+        self.assertEqual(
+            [r.name for r in sort_leaderboard(rows, "cpu", descending=False)],
+            ["b", "a", "c"],
+        )
+        # Rows without a fairshare score stay at the bottom in both directions.
+        self.assertEqual(
+            [r.name for r in sort_leaderboard(rows, "fairshare", descending=False)],
+            ["a", "b", "c"],
+        )
+
+    def test_human_hours_is_compact(self):
+        self.assertEqual(human_hours(5), "5")
+        self.assertEqual(human_hours(999), "999")
+        self.assertEqual(human_hours(1200), "1.2k")
+        self.assertEqual(human_hours(12000), "12k")
+        self.assertEqual(human_hours(75782), "76k")
+        self.assertEqual(human_hours(1770704), "1.8M")
+
+    def test_human_hours_promotes_near_million_to_M_scale(self):
+        # Values that would round up to "1000k" must cross into the M scale.
+        self.assertEqual(human_hours(999_499), "999k")
+        self.assertEqual(human_hours(999_500), "1.0M")
+        self.assertEqual(human_hours(999_750), "1.0M")
+
+    def test_format_fairshare_renders_dash_for_missing(self):
+        self.assertEqual(format_fairshare(None), "-")
+        self.assertEqual(format_fairshare(0.6806), "0.681")
+
+    def test_usage_window_start_subtracts_window_from_now(self):
+        now = datetime.datetime(2026, 7, 12, 9, 0, 0)
+        self.assertEqual(usage_window_start("24h", now=now), "2026-07-11T09:00:00")
+        self.assertEqual(usage_window_start("7d", now=now), "2026-07-05T09:00:00")
+        self.assertEqual(usage_window_start("30d", now=now), "2026-06-12T09:00:00")
+        # Unknown windows fall back to the 24h window.
+        self.assertEqual(usage_window_start("bogus", now=now), "2026-07-11T09:00:00")
+
+
+class LeaderboardClientTests(unittest.TestCase):
+    def test_fetch_usage_window_builds_sreport_command(self):
+        client = SlurmClient(user="testuser")
+        fake_runner = FakeRunner(SREPORT_SAMPLE)
+        client.runner = fake_runner
+        now = datetime.datetime(2026, 7, 12, 9, 0, 0)
+
+        entries = client.fetch_usage_window("7d", now=now)
+
+        self.assertTrue(entries)
+        args = fake_runner.calls[0][0]
+        self.assertEqual(args[0], "sreport")
+        self.assertIn("AccountUtilizationByUser", args)
+        self.assertIn("Start=2026-07-05T09:00:00", args)
+        self.assertIn("End=now", args)
+        self.assertIn("-T", args)
+        self.assertIn(USAGE_TRES, args)
+        self.assertIn(f"format={SREPORT_USAGE_FORMAT}", args)
+        self.assertIn("Hours", args)
+
+    def test_fetch_fairshare_builds_sshare_command(self):
+        client = SlurmClient(user="testuser")
+        fake_runner = FakeRunner(SSHARE_SAMPLE)
+        client.runner = fake_runner
+
+        scores = client.fetch_fairshare()
+
+        self.assertEqual(scores[("jstonge1", "pi-alwoodwa")], 0.812345)
+        self.assertEqual(
+            fake_runner.calls[0][0],
+            ["sshare", "-a", "-h", "-P", "-o", SSHARE_FAIRSHARE_FORMAT],
+        )
 
 
 if __name__ == "__main__":
