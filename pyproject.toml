@@ -1,6 +1,6 @@
 [project]
 name = "vaccs-running"
-version = "0.2.1"
+version = "0.3.0"
 description = "A colorful terminal job monitor for UVM VACC Slurm jobs."
 requires-python = ">=3.9"
 dependencies = []
@@ -11,4 +11,3 @@ vaccs-running = "vaccs_running.__main__:main"
 [build-system]
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
-

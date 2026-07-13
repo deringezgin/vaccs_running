@@ -401,6 +401,32 @@ class SlurmClient:
         )
         return parse_sshare_fairshare(output)
 
+    def fetch_default_accounts(self) -> dict[str, str]:
+        """Default Slurm account keyed by user (best effort)."""
+        try:
+            output = self.runner.run(
+                [
+                    "sacctmgr",
+                    "-n",
+                    "-P",
+                    "show",
+                    "user",
+                    "format=User,DefaultAccount",
+                ],
+                timeout=30.0,
+            )
+        except SlurmError:
+            return {}
+        accounts: dict[str, str] = {}
+        for line in output.splitlines():
+            parts = line.split("|", 1)
+            if len(parts) < 2:
+                continue
+            user, account = (part.strip() for part in parts)
+            if user and account:
+                accounts[user] = account
+        return accounts
+
     def fetch_user_compute_usage(
         self,
         window: str,

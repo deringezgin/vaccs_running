@@ -409,6 +409,7 @@ def summarize_jobs(jobs: Iterable[Job]) -> dict[str, int]:
 def build_user_leaderboard(
     usage: Iterable[UsageEntry],
     fairshare: dict[tuple[str, str], float] | None = None,
+    default_accounts: dict[str, str] | None = None,
 ) -> list[LeaderboardRow]:
     """Per-user rows, summing a user's usage across all their accounts.
 
@@ -431,7 +432,10 @@ def build_user_leaderboard(
                 + entry.cpu_hours
                 + entry.gpu_hours
             )
-    fairshare_by_user = _user_fairshare(fairshare or {})
+    fairshare_by_user = _user_fairshare(
+        fairshare or {},
+        default_accounts or {},
+    )
     return [
         LeaderboardRow(
             name=user,

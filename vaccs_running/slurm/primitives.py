@@ -257,13 +257,16 @@ def parse_fairshare_value(value: str) -> float | None:
     return parsed
 
 
-def _user_fairshare(fairshare: dict[tuple[str, str], float]) -> dict[str, float]:
-    """Best (highest) fairshare across each user's account associations."""
-    best: dict[str, float] = {}
-    for (user, _account), score in fairshare.items():
-        if user not in best or score > best[user]:
-            best[user] = score
-    return best
+def _user_fairshare(
+    fairshare: dict[tuple[str, str], float],
+    default_accounts: dict[str, str],
+) -> dict[str, float]:
+    """Fairshare for each user's default Slurm account association."""
+    return {
+        user: fairshare[(user, account)]
+        for user, account in default_accounts.items()
+        if account and (user, account) in fairshare
+    }
 
 
 def _group_fairshare(fairshare: dict[tuple[str, str], float]) -> dict[str, float]:

@@ -126,8 +126,8 @@ REQ/DONE/RUN/PEND/FAIL counts, CPU/GPU totals, longest runtime, and time limit.
 A per-user cluster-usage leaderboard, opened with `u` (or launched directly with
 `--usage` / `-U`). It is split into three panes — **last 24 hours**, **last 7
 days**, and **last 30 days** — each ranking users by GPU-hours, CPU-hours, and
-their current Slurm fairshare score, alongside the PI group each user drew on
-most.
+their current Slurm fairshare score for their default account, alongside the PI
+group each user drew on most.
 
 Because the underlying `sreport` queries are heavy, this view does **not**
 auto-refresh: it loads once when opened, each pane filling in as its query

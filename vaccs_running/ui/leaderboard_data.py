@@ -35,6 +35,7 @@ class LeaderboardDataMixin:
             # Drop the old fairshare so refreshed usage never renders against a
             # previous generation's scores (or stale scores if sshare later fails).
             self._lb_fairshare = {}
+            self._lb_default_accounts = {}
             for window, _label in LEADERBOARD_WINDOWS:
                 self._lb_windows[window] = {
                     "status": "loading",
@@ -74,11 +75,14 @@ class LeaderboardDataMixin:
     def _fetch_leaderboard_fairshare(self, generation: int) -> None:
         try:
             fairshare = self.client.fetch_fairshare()
+            default_accounts = self.client.fetch_default_accounts()
         except Exception:
             fairshare = None
+            default_accounts = None
         with self._lb_lock:
             if generation == self._lb_generation and fairshare is not None:
                 self._lb_fairshare = fairshare
+                self._lb_default_accounts = default_accounts or {}
 
     def _leaderboard_snapshot(self) -> dict[str, dict[str, object]]:
         """Build the ranked rows for each window from the cached raw data."""
@@ -87,11 +91,7 @@ class LeaderboardDataMixin:
                 window: dict(info) for window, info in self._lb_windows.items()
             }
             fairshare = dict(self._lb_fairshare)
-        build = (
-            build_group_leaderboard
-            if self.state.leaderboard_group_mode
-            else build_user_leaderboard
-        )
+            default_accounts = dict(self._lb_default_accounts)
         needle = self.state.leaderboard_filter.strip().lower()
         snapshot: dict[str, dict[str, object]] = {}
         for window, _label in LEADERBOARD_WINDOWS:
@@ -103,10 +103,18 @@ class LeaderboardDataMixin:
             # keeps its overall standing (e.g. the 32nd user still shows 32).
             rows: list[tuple[int, LeaderboardRow]] = []
             if info["status"] == "ready":
+                if self.state.leaderboard_group_mode:
+                    leaderboard = build_group_leaderboard(info["usage"], fairshare)
+                else:
+                    leaderboard = build_user_leaderboard(
+                        info["usage"],
+                        fairshare,
+                        default_accounts,
+                    )
                 ranked = list(
                     enumerate(
                         sort_leaderboard(
-                            build(info["usage"], fairshare),
+                            leaderboard,
                             self.state.leaderboard_sort,
                             descending=not self.state.leaderboard_ascending,
                         ),

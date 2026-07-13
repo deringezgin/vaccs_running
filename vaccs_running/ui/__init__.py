@@ -122,6 +122,7 @@ class VaccsRunningApp(
             for window, _label in LEADERBOARD_WINDOWS
         }
         self._lb_fairshare: dict[tuple[str, str], float] = {}
+        self._lb_default_accounts: dict[str, str] = {}
 
         # The Info tab loads its user card (accounts, fairshare, per-window
         # compute usage, GPFS quota) in a single background thread so switching

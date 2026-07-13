@@ -20,7 +20,7 @@ def leaderboard_columns(
     ranks are never truncated.
     """
     rank_w = max(3, len(str(max(1, max_rank))))
-    cpu_w, gpu_w, fs_w = 7, 6, 6
+    cpu_w, gpu_w, fs_w = 7, 6, 7
     name_min = 6
 
     # Widest layout first; drop FS, then GROUP, as the width shrinks.

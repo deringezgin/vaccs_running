@@ -64,6 +64,9 @@ class FakeClient:
     def fetch_fairshare(self):
         return {}
 
+    def fetch_default_accounts(self):
+        return {}
+
     def fetch_user_fairshare(self):
         return {"pi-test": 0.5}
 
@@ -112,6 +115,7 @@ class LeaderboardClient(FakeClient):
     def __init__(self):
         self.usage_calls = []
         self.fairshare_calls = 0
+        self.default_account_calls = 0
 
     def fetch_usage_window(self, window):
         self.usage_calls.append(window)
@@ -125,6 +129,10 @@ class LeaderboardClient(FakeClient):
     def fetch_fairshare(self):
         self.fairshare_calls += 1
         return {("alice", "pi-x"): 0.42, ("bob", "pi-x"): 0.90}
+
+    def fetch_default_accounts(self):
+        self.default_account_calls += 1
+        return {"alice": "pi-x", "bob": "pi-x"}
 
 
 class FindLeaderboardClient(FakeClient):
@@ -1876,6 +1884,7 @@ class LeaderboardTests(unittest.TestCase):
             sorted(window for window, _ in LEADERBOARD_WINDOWS),
         )
         self.assertEqual(client.fairshare_calls, 1)
+        self.assertEqual(client.default_account_calls, 1)
 
     def test_refresh_is_ignored_while_a_fetch_is_still_running(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="leaderboard")
@@ -1904,7 +1913,7 @@ class LeaderboardTests(unittest.TestCase):
         self.assertIn("GROUP", written)
         self.assertIn("pi-x", written)
         # Fairshare and compact hour counts are rendered.
-        self.assertIn("0.420", written)
+        self.assertIn("0.42", written)
         self.assertIn("700", written)
 
     def test_usage_leaves_a_blank_row_between_the_menu_and_the_panes(self):
@@ -2040,6 +2049,7 @@ class LeaderboardTests(unittest.TestCase):
             app._lb_generation += 1
             app._lb_windows["24h"] = {"status": "loading", "usage": [], "error": ""}
             app._lb_fairshare = {}
+            app._lb_default_accounts = {}
         stale = app._lb_generation - 1
 
         # A leftover thread from the old generation must not clobber the new one.
@@ -2048,6 +2058,7 @@ class LeaderboardTests(unittest.TestCase):
         with app._lb_lock:
             self.assertEqual(app._lb_windows["24h"]["status"], "loading")
             self.assertEqual(app._lb_fairshare, {})
+            self.assertEqual(app._lb_default_accounts, {})
 
         # A current-generation result is accepted.
         app._fetch_leaderboard_window(app._lb_generation, "24h")
@@ -2055,6 +2066,7 @@ class LeaderboardTests(unittest.TestCase):
         with app._lb_lock:
             self.assertEqual(app._lb_windows["24h"]["status"], "ready")
             self.assertTrue(app._lb_fairshare)
+            self.assertTrue(app._lb_default_accounts)
 
     def _open_find(self, client=None):
         app = VaccsRunningApp(

@@ -1067,12 +1067,16 @@ class LeaderboardParsingTests(unittest.TestCase):
             UsageEntry("bob", "pi-a", 200, 0),
         ]
         fairshare = {("alice", "pi-a"): 0.4, ("alice", "pi-b"): 0.9, ("bob", "pi-a"): 0.2}
-        rows = {r.name: r for r in build_user_leaderboard(usage, fairshare)}
+        default_accounts = {"alice": "pi-a", "bob": "pi-a"}
+        rows = {
+            r.name: r
+            for r in build_user_leaderboard(usage, fairshare, default_accounts)
+        }
 
         self.assertEqual(rows["alice"].cpu_hours, 400)
         self.assertEqual(rows["alice"].gpu_hours, 5)
-        # Fairshare is the best (max) across a user's associations.
-        self.assertEqual(rows["alice"].fairshare, 0.9)
+        # Fairshare comes from the user's default account, not their highest score.
+        self.assertEqual(rows["alice"].fairshare, 0.4)
         self.assertEqual(rows["bob"].cpu_hours, 200)
         self.assertNotIn("", rows)
         # The group column shows the account each user drew on most.
@@ -1088,7 +1092,19 @@ class LeaderboardParsingTests(unittest.TestCase):
         self.assertEqual(rows["dana"].group, "pi-b")
 
     def test_build_user_leaderboard_missing_fairshare_is_none(self):
-        rows = build_user_leaderboard([UsageEntry("carol", "pi-a", 10, 0)], {})
+        rows = build_user_leaderboard(
+            [UsageEntry("carol", "pi-a", 10, 0)],
+            {},
+            {"carol": "pi-a"},
+        )
+        self.assertIsNone(rows[0].fairshare)
+
+    def test_build_user_leaderboard_missing_default_account_is_none(self):
+        rows = build_user_leaderboard(
+            [UsageEntry("carol", "pi-a", 10, 0)],
+            {("carol", "pi-a"): 0.7},
+            {},
+        )
         self.assertIsNone(rows[0].fairshare)
 
     def test_build_group_leaderboard_uses_account_rows_and_drops_root(self):
@@ -1154,7 +1170,9 @@ class LeaderboardParsingTests(unittest.TestCase):
 
     def test_format_fairshare_renders_dash_for_missing(self):
         self.assertEqual(format_fairshare(None), "-")
-        self.assertEqual(format_fairshare(0.6806), "0.681")
+        self.assertEqual(format_fairshare(0.6806), "0.6806")
+        self.assertEqual(format_fairshare(0.000736), "0.00074")
+        self.assertEqual(format_fairshare(0.5), "0.5")
 
     def test_usage_window_start_subtracts_window_from_now(self):
         now = datetime.datetime(2026, 7, 12, 9, 0, 0)
@@ -1197,6 +1215,42 @@ class LeaderboardClientTests(unittest.TestCase):
             fake_runner.calls[0][0],
             ["sshare", "-a", "-h", "-P", "-o", SSHARE_FAIRSHARE_FORMAT],
         )
+
+    def test_fetch_default_accounts_reads_all_users_from_sacctmgr(self):
+        client = SlurmClient(user="testuser")
+        fake_runner = FakeRunner(
+            "alice|pi-a\n"
+            "bob|pi-b\n"
+            "malformed\n"
+            "|missing-user\n"
+            "missing-account|\n"
+        )
+        client.runner = fake_runner
+
+        self.assertEqual(
+            client.fetch_default_accounts(),
+            {"alice": "pi-a", "bob": "pi-b"},
+        )
+        self.assertEqual(
+            fake_runner.calls[0][0],
+            [
+                "sacctmgr",
+                "-n",
+                "-P",
+                "show",
+                "user",
+                "format=User,DefaultAccount",
+            ],
+        )
+
+    def test_fetch_default_accounts_degrades_to_empty_on_error(self):
+        client = SlurmClient(user="testuser")
+
+        def boom(args, timeout=12.0):
+            raise SlurmError("sacctmgr unavailable")
+
+        client.runner.run = boom
+        self.assertEqual(client.fetch_default_accounts(), {})
 
 
 class UserInfoClientTests(unittest.TestCase):
