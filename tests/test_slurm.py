@@ -10,9 +10,23 @@ from vaccs_running.slurm import (
     SREPORT_USAGE_FORMAT,
     SSHARE_FAIRSHARE_FORMAT,
     USAGE_TRES,
+    USER_INFO_WINDOWS,
+    EfficiencySummary,
+    GpfsQuota,
+    JOB_EFFICIENCY_FORMAT,
     LeaderboardRow,
     SlurmClient,
+    SlurmError,
     UsageEntry,
+    format_job_efficiency,
+    human_bytes,
+    human_duration,
+    parse_duration_seconds,
+    parse_gpfs_quota,
+    parse_reqmem_bytes,
+    parse_storage_size,
+    storage_percent,
+    summarize_job_efficiency,
     VACC_PARTITIONS,
     aggregate_user_usage,
     build_group_leaderboard,
@@ -1183,6 +1197,282 @@ class LeaderboardClientTests(unittest.TestCase):
             fake_runner.calls[0][0],
             ["sshare", "-a", "-h", "-P", "-o", SSHARE_FAIRSHARE_FORMAT],
         )
+
+
+class UserInfoClientTests(unittest.TestCase):
+    def test_usage_window_start_supports_one_year(self):
+        now = datetime.datetime(2026, 7, 12, 9, 0, 0)
+        self.assertEqual(usage_window_start("1y", now=now), "2025-07-12T09:00:00")
+
+    def test_user_info_windows_cover_the_four_requested_spans(self):
+        self.assertEqual(
+            [window for window, _label in USER_INFO_WINDOWS],
+            ["24h", "7d", "30d", "1y"],
+        )
+
+    def test_fetch_user_compute_usage_filters_to_user_and_sums_own_rows(self):
+        client = SlurmClient(user="bhimberg")
+        fake_runner = FakeRunner(SREPORT_SAMPLE)
+        client.runner = fake_runner
+        now = datetime.datetime(2026, 7, 12, 9, 0, 0)
+
+        cpu, gpu = client.fetch_user_compute_usage("30d", now=now)
+
+        # Only the per-user (non-empty login) rows are summed; account totals are
+        # skipped so a filtered roll-up never double-counts.
+        self.assertEqual((cpu, gpu), (75782, 811))
+        args = fake_runner.calls[0][0]
+        self.assertEqual(args[0], "sreport")
+        self.assertIn("Users=bhimberg", args)
+        self.assertIn("AccountUtilizationByUser", args)
+        self.assertIn("Start=2026-06-12T09:00:00", args)
+
+    def test_fetch_user_fairshare_keeps_only_the_current_user(self):
+        client = SlurmClient(user="jstonge1")
+        client.runner = FakeRunner(SSHARE_SAMPLE)
+
+        scores = client.fetch_user_fairshare()
+
+        self.assertEqual(scores, {"pi-alwoodwa": 0.812345})
+
+    def test_fetch_user_default_account_reads_sacctmgr(self):
+        client = SlurmClient(user="jstonge1")
+        fake_runner = FakeRunner("pi-alwoodwa\n")
+        client.runner = fake_runner
+
+        self.assertEqual(client.fetch_user_default_account(), "pi-alwoodwa")
+        args = fake_runner.calls[0][0]
+        self.assertEqual(args[0], "sacctmgr")
+        self.assertIn("jstonge1", args)
+        self.assertIn("format=DefaultAccount", args)
+
+    def test_fetch_user_default_account_degrades_to_empty_on_error(self):
+        client = SlurmClient(user="jstonge1")
+
+        def boom(args, timeout=12.0):
+            raise SlurmError("sacctmgr unavailable")
+
+        client.runner.run = boom
+        self.assertEqual(client.fetch_user_default_account(), "")
+
+
+GPFS_SAMPLE = "\n".join(
+    [
+        "",
+        "Group quota for your primary group: pi-ncheney",
+        "",
+        "Space limits",
+        "-" * 78,
+        "Filesystem type          blocks      quota      limit   in_doubt    grace ",
+        "gpfs1      GRP           17.58T        20T        25T     16.34G     none ",
+        "gpfs2      GRP           16.22T        35T        45T     5.962G     none ",
+        "gpfs3tmp   GRP           1.219T     7.812T     7.891T        80M     none ",
+        "-" * 78,
+        "",
+        "File Limits",
+        "-" * 78,
+        "Filesystem type           files   quota    limit in_doubt    grace  Remarks",
+        "gpfs1      GRP          6495522 6291456 12582912     3712   4 days ",
+        "-" * 78,
+        "",
+        "SPACE occupied by dgezgin within the pi-ncheney group",
+        "-" * 78,
+        "Filesystem   blocks",
+        "gpfs1        6.897T",
+        "gpfs2        32K",
+        "-" * 78,
+        "",
+        "FILES created by dgezgin within the pi-ncheney group",
+        "-" * 78,
+        "Filesystem   files",
+        "gpfs1        1523523",
+        "gpfs2        17",
+        "-" * 78,
+        "",
+        "NOTE:  Quotas are based on your group, so the figures in the first block are for",
+        "your group.  Your personal usage is in the second block. ",
+    ]
+)
+
+
+class GpfsQuotaTests(unittest.TestCase):
+    def test_parse_gpfs_quota_reads_group_and_personal_blocks(self):
+        quota = parse_gpfs_quota(GPFS_SAMPLE, user="dgezgin")
+
+        self.assertEqual(quota.primary_group, "pi-ncheney")
+        # Group space keeps (filesystem, used, quota, limit); file limits are ignored.
+        self.assertEqual(
+            quota.group_space,
+            [
+                ("gpfs1", "17.58T", "20T", "25T"),
+                ("gpfs2", "16.22T", "35T", "45T"),
+                ("gpfs3tmp", "1.219T", "7.812T", "7.891T"),
+            ],
+        )
+        self.assertEqual(quota.personal_space, [("gpfs1", "6.897T"), ("gpfs2", "32K")])
+        self.assertEqual(quota.personal_files, [("gpfs1", "1523523"), ("gpfs2", "17")])
+
+    def test_parse_gpfs_quota_handles_empty_output(self):
+        self.assertEqual(parse_gpfs_quota(""), GpfsQuota(primary_group=""))
+
+    def test_fetch_gpfs_quota_runs_my_gpfs_quota(self):
+        client = SlurmClient(user="dgezgin")
+        fake_runner = FakeRunner(GPFS_SAMPLE)
+        client.runner = fake_runner
+
+        quota = client.fetch_gpfs_quota()
+
+        self.assertEqual(quota.primary_group, "pi-ncheney")
+        self.assertEqual(fake_runner.calls[0][0], ["my_gpfs_quota"])
+
+    def test_parse_storage_size_converts_human_units(self):
+        self.assertEqual(parse_storage_size("1T"), 1024.0 ** 4)
+        self.assertEqual(parse_storage_size("32K"), 32 * 1024.0)
+        self.assertEqual(parse_storage_size("0"), 0.0)
+        self.assertIsNone(parse_storage_size("none"))
+
+    def test_storage_percent_is_used_over_quota(self):
+        self.assertAlmostEqual(storage_percent("10T", "20T"), 50.0)
+        self.assertIsNone(storage_percent("10T", "0"))
+        self.assertIsNone(storage_percent("bad", "20T"))
+
+
+# Real sacct rows (no -X): a main row per job plus .batch/.extern steps. MaxRSS
+# is only on the step rows; TotalCPU aggregates onto the main row.
+EFFICIENCY_SAMPLE = "\n".join(
+    [
+        # JobID|State|AllocCPUS|TotalCPU|CPUTimeRAW|ElapsedRaw|TimelimitRaw|ReqMem|MaxRSS|NNodes
+        "4566789_0|COMPLETED|4|01:11:01|15252|3813|2160|96G||1",
+        "4566789_0.batch|COMPLETED|4|01:11:01|15252|3813|||7666696K|1",
+        "4566789_0.extern|COMPLETED|4|00:00:00|15252|3813|||1000K|1",
+        "4566789_1|COMPLETED|4|00:00:00|200|100|10|8G||1",
+        "4566789_1.batch|COMPLETED|4|00:00:00|200|100|||4194304K|1",
+        # A queued/never-ran task: zero elapsed, must be ignored.
+        "4599999|PENDING|4|00:00:00|0|0|60|8G||1",
+    ]
+)
+
+
+class JobEfficiencyTests(unittest.TestCase):
+    def test_parse_duration_seconds_handles_slurm_formats(self):
+        self.assertEqual(parse_duration_seconds("01:11:01"), 4261.0)
+        self.assertEqual(parse_duration_seconds("12:34"), 754.0)
+        self.assertAlmostEqual(parse_duration_seconds("12:34.500"), 754.5)
+        self.assertEqual(parse_duration_seconds("1-02:00:00"), 93600.0)
+        self.assertIsNone(parse_duration_seconds(""))
+
+    def test_parse_reqmem_bytes_totals_and_suffixes(self):
+        self.assertEqual(parse_reqmem_bytes("96G", 4, 1), 96 * 1024.0 ** 3)
+        # Legacy per-CPU / per-node suffixes scale by cpus / nodes.
+        self.assertEqual(parse_reqmem_bytes("4Gc", 8, 1), 4 * 1024.0 ** 3 * 8)
+        self.assertEqual(parse_reqmem_bytes("4Gn", 8, 2), 4 * 1024.0 ** 3 * 2)
+        self.assertIsNone(parse_reqmem_bytes("", 4, 1))
+
+    def test_summarize_job_efficiency_aggregates_across_jobs(self):
+        summary = summarize_job_efficiency(EFFICIENCY_SAMPLE, "last 7 days")
+
+        # Two jobs actually ran; the pending one is dropped.
+        self.assertEqual(summary.job_count, 2)
+        self.assertEqual(summary.window_label, "last 7 days")
+        # Job 0: TotalCPU 4261 / CPUTimeRAW 15252 = 27.9%.  Job 1: 0 / 200 = 0%.
+        # Mean = ~13.97%.
+        self.assertAlmostEqual(summary.cpu_percent, 13.97, places=1)
+        # Job 0 memory: 7666696K / 96G = 7.62%.  Job 1: 4194304K(=4G) / 8G = 50%.
+        self.assertAlmostEqual(summary.mem_percent, (7.6224 + 50.0) / 2, places=1)
+        # Walltime: 3813/(2160*60)=2.94%, 100/(10*60)=16.7%.  Mean ~9.8%.
+        self.assertAlmostEqual(summary.walltime_percent, (2.944 + 16.667) / 2, places=1)
+        # Raw averages behind the percentages.
+        self.assertEqual(summary.cpu_alloc, 4.0)  # both jobs allocated 4 cores
+        # Utilized cores: job0 4261/3813=1.117, job1 0/100=0.  Mean ~0.559.
+        self.assertAlmostEqual(summary.cpu_used, (4261 / 3813 + 0.0) / 2, places=2)
+        # Requested memory: 96G and 8G.  Used: 7666696K and 4194304K(=4G).
+        self.assertAlmostEqual(
+            summary.mem_req_bytes, (96 + 8) * 1024 ** 3 / 2, places=0
+        )
+        # Requested walltime seconds: 2160*60 and 10*60.  Elapsed: 3813 and 100.
+        self.assertEqual(summary.walltime_limit_sec, (2160 * 60 + 10 * 60) / 2)
+        self.assertEqual(summary.walltime_used_sec, (3813 + 100) / 2)
+
+    def test_summarize_job_efficiency_empty(self):
+        summary = summarize_job_efficiency("", "last 7 days")
+        self.assertEqual(summary.job_count, 0)
+        self.assertIsNone(summary.cpu_percent)
+        self.assertIsNone(summary.mem_percent)
+
+    def test_human_bytes_formats_sizes(self):
+        self.assertEqual(human_bytes(96 * 1024 ** 3), "96G")
+        self.assertEqual(human_bytes(7.31 * 1024 ** 3), "7.3G")
+        self.assertEqual(human_bytes(512 * 1024 ** 2), "512M")
+        self.assertEqual(human_bytes(2 * 1024 ** 4), "2T")
+
+    def test_human_duration_formats_times(self):
+        self.assertEqual(human_duration(2160 * 60), "1d 12h")  # 36h
+        self.assertEqual(human_duration(3813), "1h 3m")
+        self.assertEqual(human_duration(45 * 60), "45m")
+        self.assertEqual(human_duration(30), "30s")
+
+    def test_fetch_job_efficiency_builds_sacct_command(self):
+        client = SlurmClient(user="dgezgin")
+        fake_runner = FakeRunner(EFFICIENCY_SAMPLE)
+        client.runner = fake_runner
+
+        summary = client.fetch_job_efficiency()
+
+        self.assertEqual(summary.job_count, 2)
+        args = fake_runner.calls[0][0]
+        self.assertEqual(args[0], "sacct")
+        self.assertIn("-u", args)
+        self.assertIn("dgezgin", args)
+        self.assertIn(JOB_EFFICIENCY_FORMAT, args)
+        self.assertNotIn("-X", args)  # steps are needed for MaxRSS
+
+    def test_fetch_job_efficiency_for_uses_sacct_dash_j(self):
+        client = SlurmClient(user="dgezgin")
+        fake_runner = FakeRunner(EFFICIENCY_SAMPLE)
+        client.runner = fake_runner
+
+        summary = client.fetch_job_efficiency_for("4566789")
+
+        self.assertEqual(summary.job_count, 2)
+        args = fake_runner.calls[0][0]
+        self.assertEqual(args[0], "sacct")
+        self.assertIn("-j", args)
+        self.assertIn("4566789", args)
+        self.assertIn(JOB_EFFICIENCY_FORMAT, args)
+
+    def test_format_job_efficiency_single_job(self):
+        sample = "\n".join(
+            [
+                "4607842|CANCELLED by 5|4|01:45.007|288|72|120|64G||1",
+                "4607842.batch|CANCELLED|4|01:45.007|288|72|||1485656K|1",
+            ]
+        )
+        text = format_job_efficiency(
+            summarize_job_efficiency(sample, "4607842"), "4607842", "craftax"
+        )
+        self.assertIn("4607842  (craftax)", text)
+        self.assertIn("CPU", text)
+        self.assertIn("36%", text)  # matches seff for this job
+        self.assertIn("used 1.4G of 64G", text)
+        self.assertNotIn("array tasks", text)  # single job, no averaging note
+
+    def test_format_job_efficiency_array_notes_task_count(self):
+        arr = "\n".join(
+            [
+                "99_0|COMPLETED|4|01:11:01|15252|3813|2160|96G||1",
+                "99_0.batch|COMPLETED|4|01:11:01|15252|3813|||7666696K|1",
+                "99_1|COMPLETED|4|01:03:00|15000|3750|2160|96G||1",
+                "99_1.batch|COMPLETED|4|01:03:00|15000|3750|||7000000K|1",
+            ]
+        )
+        text = format_job_efficiency(summarize_job_efficiency(arr, "99"), "99", "arr")
+        self.assertIn("averaged over 2 array tasks", text)
+
+    def test_format_job_efficiency_no_data(self):
+        text = format_job_efficiency(
+            summarize_job_efficiency("", "123"), "123", "pending"
+        )
+        self.assertIn("No completed job data", text)
 
 
 if __name__ == "__main__":

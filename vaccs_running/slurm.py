@@ -105,7 +105,34 @@ LEADERBOARD_WINDOW_DELTAS = {
     "24h": datetime.timedelta(days=1),
     "7d": datetime.timedelta(days=7),
     "30d": datetime.timedelta(days=30),
+    "1y": datetime.timedelta(days=365),
 }
+# The per-user "my info" panel (key `i`) reports compute usage over these four
+# windows. It reuses the sreport machinery but filters to a single user, so even
+# the year-long scan stays tolerable; each window is still fetched off-thread.
+USER_INFO_WINDOWS = [
+    ("24h", "last 24 hours"),
+    ("7d", "last 7 days"),
+    ("30d", "last 30 days"),
+    ("1y", "last year"),
+]
+# Job-efficiency summary on the Info tab. sacct over a week for one user is fast
+# even with thousands of array tasks. MaxRSS only appears on step (.batch) rows,
+# and TotalCPU only aggregates when steps are included, so we do NOT pass -X.
+JOB_EFFICIENCY_WINDOW = "now-7days"
+JOB_EFFICIENCY_WINDOW_LABEL = "last 7 days"
+JOB_EFFICIENCY_FORMAT = (
+    "JobID,State,AllocCPUS,TotalCPU,CPUTimeRAW,ElapsedRaw,"
+    "TimelimitRaw,ReqMem,MaxRSS,NNodes"
+)
+# The Info tab reports efficiency over these three windows, each fetched in its
+# own thread so it pops in as it returns (1y sacct is ~2.4s). Entries are
+# (key, sacct -S value, label).
+JOB_EFFICIENCY_WINDOWS = [
+    ("7d", "now-7days", "last 7 days"),
+    ("30d", "now-30days", "last 30 days"),
+    ("1y", "now-365days", "last year"),
+]
 LEADERBOARD_SORTS = ["gpu", "cpu", "fairshare"]
 LEADERBOARD_SORT_LABELS = {
     "gpu": "GPU hours",
@@ -405,6 +432,44 @@ class JobFilterChoices:
     users: list[str]
     groups: list[str]
     partitions: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class EfficiencySummary:
+    """Average resource efficiency across the user's recent finished jobs.
+
+    Percentages are 0..100 means over the sampled jobs, or None when no job in
+    the window carried that metric. ``cpu_percent`` and ``mem_percent`` are the
+    same figures ``seff`` reports (used vs allocated); ``walltime_percent`` is
+    elapsed vs the requested time limit.
+    """
+
+    job_count: int
+    cpu_percent: float | None
+    mem_percent: float | None
+    walltime_percent: float | None
+    window_label: str = ""
+    # Raw per-job averages behind the percentages (None when unavailable).
+    cpu_alloc: float | None = None       # allocated cores
+    cpu_used: float | None = None        # utilized cores (TotalCPU / Elapsed)
+    mem_req_bytes: float | None = None   # requested memory
+    mem_used_bytes: float | None = None  # peak RSS
+    walltime_limit_sec: float | None = None  # requested time limit
+    walltime_used_sec: float | None = None   # elapsed
+
+
+@dataclass(frozen=True)
+class GpfsQuota:
+    """Parsed ``my_gpfs_quota`` output for the info screen.
+
+    ``group_space`` rows are (filesystem, used, quota, limit); the personal rows
+    are (filesystem, value). All values keep their human units (e.g. '17.58T').
+    """
+
+    primary_group: str
+    group_space: list[tuple[str, str, str, str]] = field(default_factory=list)
+    personal_space: list[tuple[str, str]] = field(default_factory=list)
+    personal_files: list[tuple[str, str]] = field(default_factory=list)
 
 
 class CommandRunner:
@@ -744,6 +809,445 @@ class SlurmClient:
             timeout=30.0,
         )
         return parse_sshare_fairshare(output)
+
+    def fetch_user_compute_usage(
+        self,
+        window: str,
+        now: datetime.datetime | None = None,
+    ) -> tuple[int, int]:
+        """(cpu_hours, gpu_hours) for the current user over ``window``.
+
+        Restricting sreport with ``Users=`` keeps even the year window
+        tolerable, but callers still run it off the UI thread.
+        """
+        start = usage_window_start(window, now=now)
+        output = self.runner.run(
+            [
+                "sreport",
+                "-n",
+                "-P",
+                "-t",
+                "Hours",
+                "cluster",
+                SREPORT_USAGE_REPORT,
+                f"Start={start}",
+                "End=now",
+                f"Users={self.user}",
+                "-T",
+                USAGE_TRES,
+                f"format={SREPORT_USAGE_FORMAT}",
+            ],
+            timeout=300.0,
+        )
+        cpu = 0
+        gpu = 0
+        for entry in parse_sreport_usage(output):
+            # Sum only this user's own rows (one per account), never the
+            # account-total row sreport also emits with an empty login.
+            if entry.login != self.user:
+                continue
+            cpu += entry.cpu_hours
+            gpu += entry.gpu_hours
+        return cpu, gpu
+
+    def fetch_user_fairshare(self) -> dict[str, float]:
+        """Current fairshare per account for the logged-in user only."""
+        return {
+            account: score
+            for (user, account), score in self.fetch_fairshare().items()
+            if user == self.user
+        }
+
+    def fetch_user_default_account(self) -> str:
+        """The user's primary Slurm account (best effort; '' if unavailable)."""
+        try:
+            output = self.runner.run(
+                [
+                    "sacctmgr",
+                    "-n",
+                    "-P",
+                    "show",
+                    "user",
+                    self.user,
+                    "format=DefaultAccount",
+                ],
+                timeout=15.0,
+            )
+        except SlurmError:
+            return ""
+        for line in output.splitlines():
+            account = line.strip()
+            if account:
+                return account
+        return ""
+
+    def fetch_gpfs_quota(self) -> GpfsQuota:
+        """Group and personal GPFS storage usage from ``my_gpfs_quota``."""
+        output = self.runner.run(["my_gpfs_quota"], timeout=30.0)
+        return parse_gpfs_quota(output, self.user)
+
+    def fetch_job_efficiency(
+        self,
+        window: str = JOB_EFFICIENCY_WINDOW,
+        window_label: str = JOB_EFFICIENCY_WINDOW_LABEL,
+    ) -> EfficiencySummary:
+        """Average CPU/memory/walltime efficiency of the user's recent jobs."""
+        output = self.runner.run(
+            [
+                "sacct",
+                "-n",
+                "-P",
+                "-u",
+                self.user,
+                "-S",
+                window,
+                "-E",
+                "now",
+                "-o",
+                JOB_EFFICIENCY_FORMAT,
+            ],
+            timeout=60.0,
+        )
+        return summarize_job_efficiency(output, window_label)
+
+    def fetch_job_efficiency_for(self, job_id: str) -> EfficiencySummary:
+        """Efficiency for one job (or all tasks of one array), via ``sacct -j``."""
+        output = self.runner.run(
+            [
+                "sacct",
+                "-n",
+                "-P",
+                "-j",
+                str(job_id),
+                "-o",
+                JOB_EFFICIENCY_FORMAT,
+            ],
+            timeout=30.0,
+        )
+        return summarize_job_efficiency(output, str(job_id))
+
+
+def parse_gpfs_quota(output: str, user: str = "") -> GpfsQuota:
+    """Parse ``my_gpfs_quota`` into a GpfsQuota.
+
+    The tool prints four blocks: group space limits, group file limits, then the
+    user's personal space and file usage. Rows are whitespace-separated and
+    every block is bracketed by dashed dividers, so we track the current section
+    from its heading and read the filesystem rows beneath it.
+    """
+    primary = ""
+    group_space: list[tuple[str, str, str, str]] = []
+    personal_space: list[tuple[str, str]] = []
+    personal_files: list[tuple[str, str]] = []
+    section: str | None = None
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        low = line.lower()
+        if low.startswith("group quota for your primary group"):
+            primary = line.split(":", 1)[1].strip() if ":" in line else ""
+            continue
+        if low.startswith("space limits"):
+            section = "group_space"
+            continue
+        if low.startswith("file limits"):
+            section = "group_files"
+            continue
+        if low.startswith("space occupied by"):
+            section = "personal_space"
+            continue
+        if low.startswith("files created by"):
+            section = "personal_files"
+            continue
+        if low.startswith("note"):
+            # The closing NOTE wraps onto a second line; stop capturing so its
+            # continuation isn't mistaken for a filesystem row.
+            section = None
+            continue
+        if line.startswith("-") or low.startswith("filesystem"):
+            continue
+        tokens = line.split()
+        if section == "group_space" and len(tokens) >= 5 and tokens[1].upper() == "GRP":
+            group_space.append((tokens[0], tokens[2], tokens[3], tokens[4]))
+        elif section == "personal_space" and len(tokens) >= 2:
+            personal_space.append((tokens[0], tokens[1]))
+        elif section == "personal_files" and len(tokens) >= 2:
+            personal_files.append((tokens[0], tokens[1]))
+    return GpfsQuota(
+        primary_group=primary,
+        group_space=group_space,
+        personal_space=personal_space,
+        personal_files=personal_files,
+    )
+
+
+_STORAGE_UNITS = {
+    "": 1.0,
+    "K": 1024.0,
+    "M": 1024.0 ** 2,
+    "G": 1024.0 ** 3,
+    "T": 1024.0 ** 4,
+    "P": 1024.0 ** 5,
+}
+
+
+def parse_storage_size(text: str) -> float | None:
+    """Bytes for a human size like '17.58T', '32K', '0'; None if unparseable."""
+    match = re.fullmatch(
+        r"([0-9]*\.?[0-9]+)\s*([KMGTP]?)B?",
+        text.strip().upper(),
+    )
+    if not match:
+        return None
+    return float(match.group(1)) * _STORAGE_UNITS[match.group(2)]
+
+
+def storage_percent(used: str, quota: str) -> float | None:
+    """Percent of quota used, or None when either size is missing/zero."""
+    used_bytes = parse_storage_size(used)
+    quota_bytes = parse_storage_size(quota)
+    if not used_bytes or not quota_bytes:
+        return None
+    return 100.0 * used_bytes / quota_bytes
+
+
+def parse_duration_seconds(text: str) -> float | None:
+    """Seconds for a sacct duration like '01:11:01', '12:34.567', '1-02:03:04'."""
+    stripped = text.strip()
+    if not stripped or stripped.upper() in {"N/A", "UNLIMITED", "INVALID"}:
+        return None
+    days = 0
+    if "-" in stripped:
+        day_part, stripped = stripped.split("-", 1)
+        days = parse_int(day_part)
+    pieces = stripped.split(":")
+    try:
+        if len(pieces) == 3:
+            hours, minutes, seconds = pieces
+        elif len(pieces) == 2:
+            hours, (minutes, seconds) = "0", pieces
+        elif len(pieces) == 1:
+            hours, minutes, seconds = "0", "0", pieces[0]
+        else:
+            return None
+        return days * 86400 + int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    except ValueError:
+        return None
+
+
+def parse_reqmem_bytes(text: str, cpus: int, nodes: int) -> float | None:
+    """Total requested memory in bytes.
+
+    Modern Slurm reports ReqMem as a plain total (e.g. '96G'). Older output used
+    a per-CPU ('c') or per-node ('n') suffix, so those are scaled accordingly.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return None
+    suffix = ""
+    if stripped[-1:].lower() in {"c", "n"}:
+        suffix = stripped[-1:].lower()
+        stripped = stripped[:-1]
+    base = parse_storage_size(stripped)
+    if base is None:
+        return None
+    if suffix == "c":
+        return base * max(1, cpus)
+    if suffix == "n":
+        return base * max(1, nodes)
+    return base
+
+
+def summarize_job_efficiency(
+    output: str,
+    window_label: str = "",
+) -> EfficiencySummary:
+    """Average CPU/memory/walltime efficiency over the sacct rows.
+
+    sacct emits a main row per job plus one row per step; MaxRSS lives on the
+    step rows, so rows are grouped by base JobID and the peak RSS is taken across
+    a job's steps. Jobs that never ran (zero elapsed) are ignored.
+    """
+    jobs: dict[str, dict[str, object]] = {}
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("|")
+        if len(parts) < 10:
+            parts.extend([""] * (10 - len(parts)))
+        job_id = parts[0].strip()
+        base = job_id.split(".", 1)[0]
+        entry = jobs.setdefault(base, {"main": None, "maxrss": 0.0})
+        rss = parse_storage_size(parts[8].strip())
+        if rss is not None:
+            entry["maxrss"] = max(float(entry["maxrss"]), rss)
+        if "." not in job_id:
+            entry["main"] = parts
+
+    cpu_values: list[float] = []
+    mem_values: list[float] = []
+    wall_values: list[float] = []
+    cpu_alloc_values: list[float] = []
+    cpu_used_values: list[float] = []
+    mem_req_values: list[float] = []
+    mem_used_values: list[float] = []
+    wall_limit_values: list[float] = []
+    wall_used_values: list[float] = []
+    count = 0
+    for entry in jobs.values():
+        main = entry["main"]
+        if not main:
+            continue
+        elapsed = parse_int(main[5].strip())
+        cpu_time_alloc = parse_int(main[4].strip())
+        if elapsed <= 0 or cpu_time_alloc <= 0:
+            continue
+        count += 1
+        alloc_cpus = parse_int(main[2].strip())
+        total_cpu = parse_duration_seconds(main[3].strip())
+        if total_cpu is not None:
+            cpu_values.append(_clamp01(total_cpu / cpu_time_alloc))
+            cpu_alloc_values.append(alloc_cpus)
+            cpu_used_values.append(total_cpu / elapsed)
+        timelimit_minutes = parse_int(main[6].strip())
+        if timelimit_minutes > 0:
+            limit_seconds = timelimit_minutes * 60
+            wall_values.append(_clamp01(elapsed / limit_seconds))
+            wall_limit_values.append(limit_seconds)
+            wall_used_values.append(elapsed)
+        req_mem = parse_reqmem_bytes(
+            main[7].strip(), alloc_cpus, parse_int(main[9].strip())
+        )
+        max_rss = float(entry["maxrss"])
+        if req_mem and max_rss > 0:
+            mem_values.append(_clamp01(max_rss / req_mem))
+            mem_req_values.append(req_mem)
+            mem_used_values.append(max_rss)
+
+    return EfficiencySummary(
+        job_count=count,
+        cpu_percent=_average_percent(cpu_values),
+        mem_percent=_average_percent(mem_values),
+        walltime_percent=_average_percent(wall_values),
+        window_label=window_label,
+        cpu_alloc=_average(cpu_alloc_values),
+        cpu_used=_average(cpu_used_values),
+        mem_req_bytes=_average(mem_req_values),
+        mem_used_bytes=_average(mem_used_values),
+        walltime_limit_sec=_average(wall_limit_values),
+        walltime_used_sec=_average(wall_used_values),
+    )
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def _average_percent(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return 100.0 * sum(values) / len(values)
+
+
+def _average(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def human_bytes(value: float) -> str:
+    """Compact size like '96G', '7.3G', '512M' from a byte count."""
+    size = float(value)
+    for unit in ("B", "K", "M", "G", "T", "P"):
+        if size < 1024 or unit == "P":
+            if unit in {"B", "K", "M"}:
+                return f"{size:.0f}{unit}"
+            text = f"{size:.1f}"
+            if text.endswith(".0"):
+                text = text[:-2]
+            return f"{text}{unit}"
+        size /= 1024
+    return f"{size:.0f}P"
+
+
+def human_duration(seconds: float) -> str:
+    """Compact duration like '36h', '1h 3m', '2d 4h', '45m' from seconds."""
+    total = int(round(seconds))
+    if total < 60:
+        return f"{total}s"
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"{days}d {hours}h" if hours else f"{days}d"
+    if hours:
+        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    return f"{minutes}m"
+
+
+def format_job_efficiency(
+    summary: EfficiencySummary,
+    job_id: str,
+    name: str = "",
+) -> str:
+    """A seff-style plain-text efficiency report for one job/array selection."""
+    header = str(job_id)
+    if name and name not in {"-", ""}:
+        header += f"  ({name})"
+    if summary.job_count == 0:
+        return f"{header}\n\nNo completed job data available yet."
+
+    lines = [header, ""]
+    if summary.job_count > 1:
+        lines.append(f"averaged over {summary.job_count} array tasks")
+        lines.append("")
+    lines.append(
+        _efficiency_report_line(
+            "CPU",
+            summary.cpu_percent,
+            _cores_detail(summary.cpu_used, summary.cpu_alloc),
+        )
+    )
+    lines.append(
+        _efficiency_report_line(
+            "memory",
+            summary.mem_percent,
+            _bytes_detail(summary.mem_used_bytes, summary.mem_req_bytes),
+        )
+    )
+    lines.append(
+        _efficiency_report_line(
+            "walltime",
+            summary.walltime_percent,
+            _time_detail(summary.walltime_used_sec, summary.walltime_limit_sec),
+        )
+    )
+    return "\n".join(lines)
+
+
+def _efficiency_report_line(label: str, percent: float | None, detail: str) -> str:
+    percent_text = f"{percent:.0f}%" if percent is not None else "n/a"
+    line = f"{label:<9} {percent_text:>4}"
+    return f"{line}   {detail}" if detail else line
+
+
+def _cores_detail(used: float | None, alloc: float | None) -> str:
+    if used is None or alloc is None:
+        return ""
+    return f"used {used:.1f} of {alloc:.1f} cores"
+
+
+def _bytes_detail(used: float | None, requested: float | None) -> str:
+    if used is None or requested is None:
+        return ""
+    return f"used {human_bytes(used)} of {human_bytes(requested)}"
+
+
+def _time_detail(used: float | None, limit: float | None) -> str:
+    if used is None or limit is None:
+        return ""
+    return f"ran {human_duration(used)} of {human_duration(limit)}"
 
 
 def parse_squeue_line(line: str) -> Job:

@@ -50,7 +50,7 @@ To prefilter the Jobs view by Slurm state, group, or partition:
 
 ## Features
 
-The TUI has four tabs, switched with a single key at any time:
+The TUI has five tabs, switched with a single key at any time:
 
 | Key | Tab | What it shows |
 | --- | --- | --- |
@@ -58,6 +58,7 @@ The TUI has four tabs, switched with a single key at any time:
 | `n` | **Nodes** | every compute node and how busy it is |
 | `h` | **History** | your recently finished jobs |
 | `u` | **Usage** | a per-user cluster-usage leaderboard |
+| `i` | **Info** | your account, compute usage, and storage |
 
 Keys shared by the list views:
 
@@ -70,7 +71,7 @@ Keys shared by the list views:
 Job and node state is color-coded (green = running/idle, yellow = pending/mixed,
 cyan = completed/allocated, red = failed/down). Jobs, Nodes, and History
 auto-refresh while you are on them (roughly on the `--refresh` interval); Usage
-is refresh-on-demand only.
+and Info are refresh-on-demand only.
 
 <details>
 <summary><strong>Jobs</strong> (<code>j</code>)</summary>
@@ -101,7 +102,7 @@ CPU core (an idle GPU on a fully-booked node cannot actually be scheduled).
 - `f` — show only nodes with a **free** GPU
 - `d` — pop up the full `scontrol show node`
 - `p` — peek at the jobs currently running on the node (`squeue -w`)
-- `i` — pop up a cluster-wide "usage by user" summary, with free and allocated GPU totals
+- `a` — pop up a cluster-wide "activity by user" summary, with free and allocated GPU totals
 
 </details>
 
@@ -113,6 +114,9 @@ REQ/DONE/RUN/PEND/FAIL counts, CPU/GPU totals, longest runtime, and time limit.
 
 - `f` — cycle the time window: `1h → 3h → 24h → 3d → 7d`. Every window is listed
   in the header with the active one highlighted.
+- `e` — pop up the efficiency for the selected job (or array): CPU, memory, and
+  walltime used vs allocated, the same figures `seff` reports. Arrays are
+  averaged across their tasks.
 
 </details>
 
@@ -143,6 +147,31 @@ wide, desktop-oriented layout; on a screen that is too small (for example a phon
 terminal) it shows a "needs a bigger screen" notice instead of a broken layout,
 and on narrow-but-valid widths it drops the fairshare, then the group, column to
 keep the core numbers legible.
+
+</details>
+
+<details>
+<summary><strong>Info</strong> (<code>i</code>)</summary>
+
+A one-screen card for **your** account on the cluster:
+
+- **Account** — your username and primary PI group
+- **Fairshare** — your current Slurm fairshare score per account, labelled
+  high / normal / low priority
+- **Compute usage** — exact CPU-hours and GPU-hours over the **last 24 hours, 7
+  days, 30 days, and 1 year** (per-user `sreport`, so even the year window is
+  fast)
+- **Storage** — your PI group's GPFS space quota per filesystem (with % used),
+  plus your own space and file counts (from `my_gpfs_quota`)
+- **Job efficiency** (shown last) — your average CPU, memory, and walltime
+  efficiency (used vs allocated, the same figures `seff` reports) over the last
+  **7 days, 30 days, and 1 year**, with the job count for each. Each window is
+  queried separately and streams in as it returns (the year is the slow one).
+  Below the table, the raw per-job averages spell it out — e.g. "requested 4.2
+  CPU cores but used 1.0", the same for memory and walltime
+
+It loads in the background when you open the tab and is refresh-on-demand with
+`r`.
 
 </details>
 

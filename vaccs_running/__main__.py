@@ -22,6 +22,14 @@ def slurm_state_arg(value: str) -> str:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+def _initial_view(args: argparse.Namespace) -> str:
+    if getattr(args, "info", False):
+        return "info"
+    if getattr(args, "usage", False):
+        return "leaderboard"
+    return "jobs"
+
+
 def comma_list_arg(value: str) -> str:
     values = [
         item.strip()
@@ -61,6 +69,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--usage",
         action="store_true",
         help="Open directly on the Usage view.",
+    )
+    parser.add_argument(
+        "-I",
+        "--info",
+        action="store_true",
+        help="Open directly on the Info view (your account, usage, and storage).",
     )
     parser.add_argument(
         "-p",
@@ -138,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
         VaccsRunningApp(
             client=client,
             refresh_seconds=max(0.0, args.refresh),
-            initial_view="leaderboard" if args.usage else "jobs",
+            initial_view=_initial_view(args),
         ).run()
         return 0
     except KeyboardInterrupt:

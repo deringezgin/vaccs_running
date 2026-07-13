@@ -2,6 +2,8 @@ import curses
 import unittest
 
 from vaccs_running.slurm import (
+    EfficiencySummary,
+    GpfsQuota,
     Job,
     JobFilterChoices,
     JobRecord,
@@ -17,7 +19,9 @@ from vaccs_running.ui import (
     LEADERBOARD_MIN_WIDTH,
     LEADERBOARD_PAGE,
     VaccsRunningApp,
+    build_user_info_lines,
     command_text,
+    fairshare_style,
     filter_choice_options,
     leaderboard_columns,
     leaderboard_too_small,
@@ -34,6 +38,8 @@ from vaccs_running.ui import (
 
 
 class FakeClient:
+    user = "tester"
+
     def fetch_jobs(self):
         return []
 
@@ -57,6 +63,47 @@ class FakeClient:
 
     def fetch_fairshare(self):
         return {}
+
+    def fetch_user_fairshare(self):
+        return {"pi-test": 0.5}
+
+    def fetch_user_default_account(self):
+        return "pi-test"
+
+    def fetch_user_compute_usage(self, window):
+        return (10, 2)
+
+    def fetch_gpfs_quota(self):
+        return GpfsQuota(
+            primary_group="pi-test",
+            group_space=[("gpfs1", "1T", "2T", "3T")],
+            personal_space=[("gpfs1", "500G")],
+            personal_files=[("gpfs1", "42")],
+        )
+
+    def fetch_job_efficiency(self, window=None, window_label=""):
+        return EfficiencySummary(
+            job_count=5,
+            cpu_percent=82.0,
+            mem_percent=60.0,
+            walltime_percent=50.0,
+            window_label=window_label or "last 7 days",
+        )
+
+    def fetch_job_efficiency_for(self, job_id):
+        return EfficiencySummary(
+            job_count=1,
+            cpu_percent=50.0,
+            mem_percent=25.0,
+            walltime_percent=40.0,
+            window_label=str(job_id),
+            cpu_alloc=4.0,
+            cpu_used=2.0,
+            mem_req_bytes=8 * 1024 ** 3,
+            mem_used_bytes=2 * 1024 ** 3,
+            walltime_limit_sec=3600,
+            walltime_used_sec=1440,
+        )
 
 
 class LeaderboardClient(FakeClient):
@@ -1346,16 +1393,16 @@ class NodeFilterTests(unittest.TestCase):
             [("squeue -a -w h2node01", "jobs for h2node01", (ord("p"),))],
         )
 
-    def test_nodes_header_shows_usage_shortcut(self):
+    def test_nodes_header_shows_activity_shortcut(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="nodes")
         screen = FakeScreen(height=12, width=120)
 
         app._draw_header(screen, 120)
 
         written = " ".join(write[2] for write in screen.writes)
-        self.assertIn(" i usage ", written)
+        self.assertIn(" a activity ", written)
 
-    def test_i_opens_cluster_usage_from_nodes_view(self):
+    def test_a_opens_cluster_usage_from_nodes_view(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
         calls = []
         app.state.view = "nodes"
@@ -1366,14 +1413,14 @@ class NodeFilterTests(unittest.TestCase):
             )
         )
 
-        self.assertTrue(app._handle_key(None, ord("i")))
+        self.assertTrue(app._handle_key(None, ord("a")))
 
         self.assertEqual(
             calls,
-            [("running usage by user", "usage by user", (ord("i"),), True)],
+            [("running activity by user", "usage by user", (ord("a"),), True)],
         )
 
-    def test_i_is_nodes_only(self):
+    def test_a_is_nodes_only(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
         calls = []
         app.state.view = "jobs"
@@ -1383,7 +1430,7 @@ class NodeFilterTests(unittest.TestCase):
             )
         )
 
-        self.assertTrue(app._handle_key(None, ord("i")))
+        self.assertTrue(app._handle_key(None, ord("a")))
 
         self.assertEqual(calls, [])
 
@@ -2153,6 +2200,300 @@ class LeaderboardTests(unittest.TestCase):
             # Right-aligned: sits in the right half, near the edge.
             self.assertGreater(x, 140 // 2, f"{view}: quit hint should be right-aligned")
             self.assertLessEqual(x + len("q quit"), 140)
+
+
+def _info_text(rows):
+    """Flatten the segmented info rows into plain-text lines."""
+    return ["".join(text for text, _style in row) for row in rows]
+
+
+class UserInfoTests(unittest.TestCase):
+    READY = {
+        "status": "ready",
+        "default": "pi-smith",
+        "fairshare": {"pi-smith": 0.742, "pi-jones": 0.081},
+        "accounts_error": "",
+        "windows": {
+            "24h": (0, 0),
+            "7d": (90, 20),
+            "30d": (35120, 8540),
+            "1y": (582137, 142830),
+        },
+        "efficiency": {
+            "7d": EfficiencySummary(
+                1410, 27.94, 7.62, 2.9, "last 7 days",
+                cpu_alloc=4.0, cpu_used=1.05,
+                mem_req_bytes=96 * 1024 ** 3, mem_used_bytes=7.31 * 1024 ** 3,
+                walltime_limit_sec=2160 * 60, walltime_used_sec=3813,
+            ),
+            "30d": EfficiencySummary(6222, 30.0, 9.0, 12.0, "last 30 days"),
+            "1y": None,  # still streaming in
+        },
+        "gpfs": GpfsQuota(
+            primary_group="pi-smith",
+            group_space=[("gpfs1", "17.58T", "20T", "25T"), ("gpfs2", "1T", "35T", "45T")],
+            personal_space=[("gpfs1", "6.897T"), ("gpfs2", "32K")],
+            personal_files=[("gpfs1", "1523523"), ("gpfs2", "17")],
+        ),
+        "gpfs_error": "",
+    }
+
+    def test_fairshare_style_maps_score_to_priority_band(self):
+        self.assertEqual(fairshare_style(0.9), ("good", "high priority"))
+        self.assertEqual(fairshare_style(0.3), ("warn", "normal"))
+        self.assertEqual(fairshare_style(0.05), ("bad", "low priority"))
+        self.assertEqual(fairshare_style(None), ("muted", ""))
+
+    def test_build_user_info_lines_renders_the_full_screen(self):
+        lines = _info_text(build_user_info_lines("dgezgin", self.READY))
+        blob = "\n".join(lines)
+
+        self.assertIn("dgezgin", blob)
+        # Primary account is shown in the header and first in the fairshare list.
+        self.assertIn("pi-smith", blob)
+        self.assertIn("primary", blob)
+        self.assertLess(blob.index("pi-smith"), blob.index("pi-jones"))
+        self.assertIn("0.742", blob)
+        self.assertIn("low priority", blob)
+        # All four windows with EXACT, comma-grouped hour counts (no bars).
+        self.assertIn("last 24 hours", blob)
+        self.assertIn("last year", blob)
+        self.assertIn("582,137", blob)
+        self.assertIn("142,830", blob)
+        self.assertNotIn("|", blob)  # no progress bars anywhere
+        # No VACC command legend.
+        self.assertNotIn("my_compute_usage", blob)
+        self.assertNotIn("user_tools", blob)
+        # Job efficiency table: raw percentages + job counts per window, and the
+        # windows that are still loading show a spinner. No invented tiers/tips.
+        self.assertIn("job efficiency", blob)
+        self.assertIn("28%", blob)  # 7d CPU 27.94 -> 28
+        self.assertIn("1,410", blob)  # 7d job count
+        self.assertIn("6,222", blob)  # 30d job count
+        self.assertIn("loading", blob)  # 1y window still streaming
+        self.assertNotIn("wasteful", blob)
+        self.assertNotIn("tip", blob)
+        self.assertNotIn("--mem", blob)
+        # Raw "requested X but used Y" averages for the first window with data.
+        self.assertIn("requested 4.0 CPU cores but used 1.1", blob)
+        self.assertIn("requested 96G of memory but used 7.3G", blob)
+        self.assertIn("walltime but used", blob)
+        # GPFS storage: group quota (with %) and personal usage.
+        self.assertIn("storage", blob)
+        self.assertIn("17.58T / 20T", blob)
+        self.assertIn("(88%)", blob)
+        self.assertIn("your usage", blob)
+        self.assertIn("1,523,523 files", blob)
+
+    def test_efficiency_rows_are_raw_numbers_with_no_tiers(self):
+        # Percentages are shown plainly (no verdict words), and no metric gets a
+        # good/warn/bad "grade" style — only muted/heading/cpu/gpu appear.
+        rows = build_user_info_lines("dgezgin", self.READY)
+        eff_rows = [
+            row
+            for row in rows
+            if any("last 7 days" in text for text, _ in row)
+            and any("%" in text for text, _ in row)
+        ]
+        self.assertTrue(eff_rows)
+        styles = {style for row in eff_rows for _text, style in row}
+        self.assertFalse(styles & {"good", "warn", "bad"})
+
+    def test_efficiency_windows_stream_in_independently(self):
+        snapshot = {
+            "status": "ready",
+            "default": "",
+            "fairshare": {},
+            "windows": {},
+            "efficiency": {
+                "7d": EfficiencySummary(3, 50.0, 25.0, 40.0, "last 7 days"),
+                "30d": "error",
+                "1y": None,
+            },
+            "gpfs": None,
+            "gpfs_error": "x",
+        }
+        blob = "\n".join(_info_text(build_user_info_lines("dgezgin", snapshot, "/")))
+        self.assertIn("last 7 days", blob)
+        self.assertIn("50%", blob)          # 7d ready
+        self.assertIn("loading", blob)      # 1y still loading
+        # 30d failed + storage failed -> two "unavailable".
+        self.assertEqual(blob.count("unavailable"), 2)
+
+    def test_efficiency_zero_jobs_says_so(self):
+        snapshot = {
+            "status": "ready",
+            "default": "",
+            "fairshare": {},
+            "windows": {},
+            "efficiency": {
+                "7d": EfficiencySummary(0, None, None, None, "last 7 days"),
+                "30d": EfficiencySummary(0, None, None, None, "last 30 days"),
+                "1y": EfficiencySummary(0, None, None, None, "last year"),
+            },
+            "gpfs": None,
+            "gpfs_error": "",
+        }
+        blob = "\n".join(_info_text(build_user_info_lines("dgezgin", snapshot)))
+        self.assertIn("no finished jobs", blob)
+
+    def test_build_user_info_lines_shows_loading_then_stops(self):
+        rows = build_user_info_lines(
+            "dgezgin", {"status": "loading"}, spinner="/"
+        )
+        blob = "\n".join(_info_text(rows))
+        self.assertIn("dgezgin", blob)
+        self.assertIn("loading your VACC info", blob)
+        # Nothing else renders until data arrives.
+        self.assertNotIn("fairshare", blob)
+
+    def test_build_user_info_lines_shows_unavailable_sections(self):
+        snapshot = {
+            "status": "ready",
+            "default": "",
+            "fairshare": {},
+            "accounts_error": "sshare boom",
+            "windows": {"24h": "error", "7d": (1, 0), "30d": (2, 0), "1y": (3, 0)},
+            "gpfs": None,
+            "gpfs_error": "no my_gpfs_quota",
+        }
+        blob = "\n".join(_info_text(build_user_info_lines("dgezgin", snapshot)))
+        # Fairshare, the 24h window, and storage each degrade independently.
+        self.assertEqual(blob.count("unavailable"), 3)
+
+    def test_i_switches_to_the_info_tab(self):
+        for view in ("jobs", "nodes", "history", "leaderboard"):
+            app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view=view)
+
+            self.assertTrue(app._handle_key(None, ord("i")))
+            self.assertEqual(app.state.view, "info")
+
+    def test_i_edits_the_filter_while_the_find_box_is_open(self):
+        app = VaccsRunningApp(
+            FakeClient(), refresh_seconds=0, initial_view="leaderboard"
+        )
+        app.state.leaderboard_filter_editing = True
+
+        self.assertTrue(app._handle_key(None, ord("i")))
+
+        # Typing 'i' filters instead of switching tabs.
+        self.assertEqual(app.state.view, "leaderboard")
+        self.assertEqual(app.state.leaderboard_filter, "i")
+
+    def test_switching_to_info_starts_the_loader(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="jobs")
+        app._handle_key(None, ord("i"))
+        self.assertTrue(app._info_started)
+        self.assertIn(app._info_snapshot()["status"], {"loading", "ready"})
+
+    def test_fetch_info_populates_a_ready_snapshot(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="jobs")
+        app._info_generation = 1
+        app._info_data = {"status": "loading", "efficiency": {"7d": None}}
+
+        app._fetch_info_base(1)  # run the base fetch body synchronously
+        app._fetch_info_efficiency(1, "7d", "now-7days", "last 7 days")
+
+        snapshot = app._info_snapshot()
+        self.assertEqual(snapshot["status"], "ready")
+        self.assertEqual(snapshot["default"], "pi-test")
+        self.assertEqual(snapshot["windows"]["1y"], (10, 2))
+        self.assertEqual(snapshot["gpfs"].primary_group, "pi-test")
+        self.assertEqual(snapshot["efficiency"]["7d"].job_count, 5)
+
+    def test_r_refreshes_info_and_scroll_keys_move_the_offset(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="info")
+        app.state.info_scroll = 0
+
+        self.assertTrue(app._handle_info_key(ord("j")))
+        self.assertEqual(app.state.info_scroll, 1)
+        self.assertTrue(app._handle_info_key(ord("k")))
+        self.assertEqual(app.state.info_scroll, 0)
+        self.assertTrue(app._handle_info_key(ord("r")))
+        # 'r' triggers a refresh; the message reflects it.
+        self.assertIn("info", app.state.message)
+        # Tab-switch keys are NOT consumed by the info handler.
+        self.assertFalse(app._handle_info_key(ord("n")))
+
+    def test_header_shows_info_tab(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="info")
+        screen = FakeScreen(height=40, width=120)
+
+        app._draw_header(screen, 120)
+
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn(" i Info ", written)
+        self.assertIn(" r refresh ", written)
+
+    def test_draw_info_writes_the_screen_without_error(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="info")
+        app._info_data = dict(self.READY)
+        screen = FakeScreen(height=40, width=120)
+
+        app._draw_info(screen, 40, 120)
+
+        written = "\n".join(write[2] for write in screen.writes)
+        self.assertIn("tester", written)  # username comes from the client
+        self.assertIn("582,137", written)
+        self.assertIn("17.58T / 20T", written)
+
+
+class HistoryEfficiencyTests(unittest.TestCase):
+    def _app_with_selection(self, job_id="4566789", name="myjob"):
+        from types import SimpleNamespace
+
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="history")
+        app._selected_history_group = lambda: SimpleNamespace(
+            array_parent=job_id, name=name
+        )
+        return app
+
+    def test_e_opens_efficiency_popup_for_selected_job(self):
+        app = self._app_with_selection()
+        calls = []
+        app._popup = (
+            lambda stdscr, title, text, close_keys=(), refresh_while_open=True: calls.append(
+                (title, text() if callable(text) else text, close_keys, refresh_while_open)
+            )
+        )
+
+        self.assertTrue(app._handle_key(None, ord("e")))
+
+        self.assertEqual(len(calls), 1)
+        title, text, close_keys, refresh = calls[0]
+        self.assertIn("4566789", title)
+        self.assertEqual(close_keys, (ord("e"),))
+        self.assertFalse(refresh)  # computed once, no auto-refresh
+        # The report references the job and shows the raw used/allocated figures.
+        self.assertIn("4566789", text)
+        self.assertIn("myjob", text)
+        self.assertIn("used 2.0 of 4.0 cores", text)
+
+    def test_e_does_nothing_without_a_selection(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="history")
+        app._selected_history_group = lambda: None
+        calls = []
+        app._popup = lambda *a, **k: calls.append(a)
+
+        self.assertTrue(app._handle_key(None, ord("e")))
+        self.assertEqual(calls, [])
+
+    def test_e_is_history_only(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="jobs")
+        opened = []
+        app._show_job_efficiency = lambda stdscr: opened.append(True)
+
+        self.assertTrue(app._handle_key(None, ord("e")))
+        self.assertEqual(opened, [])  # not triggered outside history
+
+    def test_history_header_shows_efficiency_shortcut(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="history")
+        screen = FakeScreen(height=40, width=120)
+
+        app._draw_header(screen, 120)
+
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn(" e efficiency ", written)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ from .slurm import (
     LEADERBOARD_SORT_LABELS,
     LEADERBOARD_SORTS,
     LEADERBOARD_WINDOWS,
+    JOB_EFFICIENCY_WINDOWS,
     Job,
     JobFilterChoices,
     JobRecord,
@@ -20,15 +21,20 @@ from .slurm import (
     Node,
     SlurmClient,
     SlurmError,
+    USER_INFO_WINDOWS,
     VACC_PARTITIONS,
     build_group_leaderboard,
     build_user_leaderboard,
     format_fairshare,
+    format_job_efficiency,
     group_job_records,
+    human_bytes,
+    human_duration,
     human_hours,
     plural_label,
     record_from_job,
     sort_leaderboard,
+    storage_percent,
     summarize_job_records,
     summarize_jobs,
     summarize_nodes,
@@ -115,6 +121,26 @@ JOB_STATE_FILTER_OPTIONS = [
 ]
 JOB_STATE_CODES = [state for state, _ in JOB_STATE_FILTER_OPTIONS]
 
+# The Info tab (key `i`) renders colored segments. Each segment carries a
+# semantic style name so the line builder stays pure/testable; the drawer maps
+# the style to a curses color pair here.
+USER_INFO_STYLE_PAIRS = {
+    "title": TITLE_PAIR,
+    "heading": 6,
+    "muted": MUTED_PAIR,
+    "cpu": 3,
+    "gpu": 6,
+    "good": 1,
+    "warn": 2,
+    "bad": 4,
+    "accent": ACTIVE_TAB_PAIR,
+}
+USER_INFO_BOLD_STYLES = {"title", "heading"}
+# Info content starts on row 5, matching the gap the other tables leave above
+# them (below the header + controls rows).
+INFO_TOP = 5
+SPINNER_FRAMES = "|/-\\"
+
 
 @dataclass
 class AppState:
@@ -137,6 +163,7 @@ class AppState:
     leaderboard_scroll: int = 0
     leaderboard_filter: str = ""
     leaderboard_filter_editing: bool = False
+    info_scroll: int = 0
 
 
 class VaccsRunningApp:
@@ -155,7 +182,7 @@ class VaccsRunningApp:
             history=[],
             view=(
                 initial_view
-                if initial_view in {"jobs", "history", "nodes", "leaderboard"}
+                if initial_view in {"jobs", "history", "nodes", "leaderboard", "info"}
                 else "jobs"
             ),
         )
@@ -176,11 +203,19 @@ class VaccsRunningApp:
         }
         self._lb_fairshare: dict[tuple[str, str], float] = {}
 
+        # The Info tab loads its user card (accounts, fairshare, per-window
+        # compute usage, GPFS quota) in a single background thread so switching
+        # to the tab never blocks. Manual refresh only (press 'r').
+        self._info_lock = threading.Lock()
+        self._info_generation = 0
+        self._info_started = False
+        self._info_data: dict[str, object] = {"status": "idle"}
+
     def run(self) -> None:
         curses.wrapper(self._main)
 
     def _active_refresh_seconds(self) -> float:
-        if self.state.view == "leaderboard":
+        if self.state.view in {"leaderboard", "info"}:
             # Manual refresh only: usage queries are heavy, so never auto-run them.
             return 0.0
         if not self.refresh_seconds:
@@ -275,6 +310,10 @@ class VaccsRunningApp:
             # First visit kicks off the background load; afterwards the cached
             # results are kept until the user presses 'r'.
             self._ensure_leaderboard_loaded()
+            self.state.last_refresh = time.monotonic()
+            return
+        if self.state.view == "info":
+            self._ensure_info_loaded()
             self.state.last_refresh = time.monotonic()
             return
         if self.state.view == "history":
@@ -426,6 +465,114 @@ class VaccsRunningApp:
             }
         return snapshot
 
+    # -- Info tab background fetching --------------------------------------
+
+    def _ensure_info_loaded(self) -> None:
+        if not self._info_started:
+            self._start_info_refresh()
+
+    def _info_loading(self) -> bool:
+        with self._info_lock:
+            if self._info_data.get("status") == "loading":
+                return True
+            efficiency = self._info_data.get("efficiency")
+            return isinstance(efficiency, dict) and any(
+                value is None for value in efficiency.values()
+            )
+
+    def _start_info_refresh(self) -> bool:
+        """Kick off the info fetch.
+
+        The account/usage/storage card loads in one thread; each job-efficiency
+        window (7d/30d/1y) loads in its own thread so it pops in as it returns
+        (the 1-year sacct is the slow one). All threads write into
+        ``_info_data`` under the lock, guarded by a generation counter.
+        """
+        if self._info_loading():
+            return False
+        self._info_started = True
+        with self._info_lock:
+            self._info_generation += 1
+            generation = self._info_generation
+            self._info_data = {
+                "status": "loading",
+                "fairshare": {},
+                "default": "",
+                "accounts_error": "",
+                "windows": {},
+                "gpfs": None,
+                "gpfs_error": "",
+                # None per window == still loading.
+                "efficiency": {key: None for key, _w, _l in JOB_EFFICIENCY_WINDOWS},
+            }
+        threading.Thread(
+            target=self._fetch_info_base, args=(generation,), daemon=True
+        ).start()
+        for key, window, label in JOB_EFFICIENCY_WINDOWS:
+            threading.Thread(
+                target=self._fetch_info_efficiency,
+                args=(generation, key, window, label),
+                daemon=True,
+            ).start()
+        return True
+
+    def _fetch_info_base(self, generation: int) -> None:
+        """Load accounts, compute usage, and storage (the always-shown card)."""
+        update: dict[str, object] = {}
+        try:
+            update["fairshare"] = self.client.fetch_user_fairshare()
+            update["default"] = self.client.fetch_user_default_account()
+            update["accounts_error"] = ""
+        except Exception as exc:
+            update["fairshare"] = {}
+            update["default"] = ""
+            update["accounts_error"] = str(exc)
+
+        windows: dict[str, object] = {}
+        for window, _label in USER_INFO_WINDOWS:
+            try:
+                windows[window] = self.client.fetch_user_compute_usage(window)
+            except Exception:
+                windows[window] = "error"
+        update["windows"] = windows
+
+        try:
+            update["gpfs"] = self.client.fetch_gpfs_quota()
+            update["gpfs_error"] = ""
+        except Exception as exc:
+            update["gpfs"] = None
+            update["gpfs_error"] = str(exc)
+
+        with self._info_lock:
+            if generation == self._info_generation:
+                self._info_data.update(update)
+                self._info_data["status"] = "ready"
+
+    def _fetch_info_efficiency(
+        self,
+        generation: int,
+        key: str,
+        window: str,
+        label: str,
+    ) -> None:
+        try:
+            result: object = self.client.fetch_job_efficiency(window, label)
+        except Exception:
+            result = "error"
+        with self._info_lock:
+            if generation == self._info_generation:
+                efficiency = self._info_data.get("efficiency")
+                if isinstance(efficiency, dict):
+                    efficiency[key] = result
+
+    def _info_snapshot(self) -> dict[str, object]:
+        with self._info_lock:
+            data = dict(self._info_data)
+        efficiency = data.get("efficiency")
+        if isinstance(efficiency, dict):
+            data["efficiency"] = dict(efficiency)
+        return data
+
     def _visible_jobs(self) -> list[Job]:
         if self._jobs_filter_active():
             return self.state.jobs
@@ -482,7 +629,7 @@ class VaccsRunningApp:
         return visible
 
     def _visible_count(self) -> int:
-        if self.state.view == "leaderboard":
+        if self.state.view in {"leaderboard", "info"}:
             return 0
         if self.state.view == "nodes":
             return len(self._visible_nodes())
@@ -501,6 +648,8 @@ class VaccsRunningApp:
         if key in (ord("q"), 27):
             return False
         if self.state.view == "leaderboard" and self._handle_leaderboard_key(key):
+            return True
+        if self.state.view == "info" and self._handle_info_key(key):
             return True
         if key == curses.KEY_DOWN:
             self.state.selected += 1
@@ -526,6 +675,8 @@ class VaccsRunningApp:
             self._switch_view("jobs")
         elif key == ord("u"):
             self._switch_view("leaderboard")
+        elif key == ord("i"):
+            self._switch_view("info")
         elif key == ord("g"):
             if self.state.view == "nodes":
                 enabled = not self.state.gpu_nodes_only
@@ -562,12 +713,40 @@ class VaccsRunningApp:
         elif key == ord("p"):
             if self.state.view == "nodes":
                 self._show_node_jobs(stdscr)
-        elif key == ord("i"):
+        elif key == ord("a"):
             if self.state.view == "nodes":
                 self._show_node_usage(stdscr)
+        elif key == ord("e"):
+            if self.state.view == "history":
+                self._show_job_efficiency(stdscr)
 
         self._clamp_selection()
         return True
+
+    def _handle_info_key(self, key: int) -> bool:
+        """Info-tab keys: refresh + scroll. Returns False so tab keys pass through."""
+        if key == ord("r"):
+            if self._start_info_refresh():
+                self.state.message = "info refreshing"
+            else:
+                self.state.message = "info still loading"
+            return True
+        if key in (curses.KEY_DOWN, ord("j")):
+            self.state.info_scroll += 1
+            return True
+        if key in (curses.KEY_UP, ord("k")):
+            self.state.info_scroll = max(0, self.state.info_scroll - 1)
+            return True
+        if key == curses.KEY_NPAGE:
+            self.state.info_scroll += 10
+            return True
+        if key == curses.KEY_PPAGE:
+            self.state.info_scroll = max(0, self.state.info_scroll - 10)
+            return True
+        if key == curses.KEY_HOME:
+            self.state.info_scroll = 0
+            return True
+        return False
 
     def _handle_leaderboard_key(self, key: int) -> bool:
         """Handle leaderboard-only keys; return False so tab keys still switch views."""
@@ -711,6 +890,7 @@ class VaccsRunningApp:
         self.state.view = view
         self.state.selected = 0
         self.state.scroll = 0
+        self.state.info_scroll = 0
         self._refresh_current()
         self._clamp_selection()
 
@@ -771,7 +951,9 @@ class VaccsRunningApp:
             stdscr.refresh()
             return
         self._draw_header(stdscr, width)
-        if self.state.view == "nodes":
+        if self.state.view == "info":
+            self._draw_info(stdscr, height, width)
+        elif self.state.view == "nodes":
             self._draw_nodes_table(stdscr, self._visible_nodes(), height, width)
             self._draw_node_detail(stdscr, height, width)
         elif self.state.view == "history":
@@ -1007,6 +1189,7 @@ class VaccsRunningApp:
             ("nodes", " n Nodes "),
             ("history", " h History "),
             ("leaderboard", " u Usage "),
+            ("info", " i Info "),
         ]:
             attr = (
                 self._pair(ACTIVE_TAB_PAIR) | curses.A_BOLD
@@ -1052,8 +1235,8 @@ class VaccsRunningApp:
             x += len(" d detail ") + 1
             self._addstr(stdscr, 3, x, " p peek ", self._pair(MUTED_PAIR))
             x += len(" p peek ") + 1
-            self._addstr(stdscr, 3, x, " i usage ", self._pair(MUTED_PAIR))
-            x += len(" i usage ") + 1
+            self._addstr(stdscr, 3, x, " a activity ", self._pair(MUTED_PAIR))
+            x += len(" a activity ") + 1
         elif self.state.view == "history":
             x = 1
             # " f filter: 1h / 3h / 24h / 3d / 7d " with the active window highlighted.
@@ -1064,6 +1247,8 @@ class VaccsRunningApp:
                 [(window, window) for window, _label in HISTORY_FILTER_OPTIONS],
                 self.state.history_window,
             )
+            self._addstr(stdscr, 3, x, " e efficiency ", self._pair(MUTED_PAIR))
+            x += len(" e efficiency ") + 1
         elif self.state.view == "leaderboard":
             x = 1
             # Each control lists every option with the active one highlighted.
@@ -1103,6 +1288,11 @@ class VaccsRunningApp:
                 [("ascending", "ascending"), ("descending", "descending")],
                 "ascending" if self.state.leaderboard_ascending else "descending",
             )
+        elif self.state.view == "info":
+            x = 1
+            refresh_text = " r refresh "
+            self._addstr(stdscr, 3, x, refresh_text, self._pair(MUTED_PAIR))
+            x += len(refresh_text) + 1
         else:
             x = 1
             group_text = " g group "
@@ -1824,10 +2014,69 @@ class VaccsRunningApp:
     def _show_node_usage(self, stdscr: curses.window) -> None:
         self._popup(
             stdscr,
-            "running usage by user",
+            "running activity by user",
             command_text(lambda _: self.client.cluster_usage(), ""),
-            close_keys=(ord("i"),),
+            close_keys=(ord("a"),),
         )
+
+    def _show_job_efficiency(self, stdscr: curses.window) -> None:
+        group = self._selected_history_group()
+        if not group:
+            return
+        job_id = group.array_parent
+        name = group.name
+        self._popup(
+            stdscr,
+            f"efficiency · {job_id}",
+            lambda: self._job_efficiency_text(job_id, name),
+            close_keys=(ord("e"),),
+            refresh_while_open=False,
+        )
+
+    def _job_efficiency_text(self, job_id: str, name: str) -> str:
+        try:
+            summary = self.client.fetch_job_efficiency_for(job_id)
+        except SlurmError as exc:
+            return str(exc)
+        return format_job_efficiency(summary, job_id, name)
+
+    def _draw_info(self, stdscr: curses.window, height: int, width: int) -> None:
+        """Full-screen Info tab: the current user's account, usage & storage."""
+        user = getattr(self.client, "user", "") or "me"
+        snapshot = self._info_snapshot()
+        spinner = SPINNER_FRAMES[int(time.monotonic() * 6) % len(SPINNER_FRAMES)]
+        rows = build_user_info_lines(user, snapshot, spinner)
+
+        body_height = max(1, height - INFO_TOP)
+        max_scroll = max(0, len(rows) - body_height)
+        self.state.info_scroll = max(0, min(self.state.info_scroll, max_scroll))
+        scroll = self.state.info_scroll
+
+        for offset, row in enumerate(rows[scroll : scroll + body_height]):
+            self._draw_info_row(stdscr, INFO_TOP + offset, row, width)
+        if scroll < max_scroll:
+            hint = "↓ more "
+            self._addstr(
+                stdscr, height - 1, max(2, width - len(hint) - 2), hint,
+                self._pair(MUTED_PAIR),
+            )
+
+    def _draw_info_row(
+        self,
+        win: curses.window,
+        y: int,
+        row: list[tuple[str, str]],
+        width: int,
+    ) -> None:
+        x = 2
+        for text, style in row:
+            if x >= width - 1:
+                break
+            attr = self._pair(USER_INFO_STYLE_PAIRS.get(style, MUTED_PAIR))
+            if style in USER_INFO_BOLD_STYLES:
+                attr |= curses.A_BOLD
+            self._addstr(win, y, x, text, attr)
+            x += len(text)
 
     def _show_jobs_filter(self, stdscr: curses.window) -> None:
         choices = self._fetch_job_filter_choices()
@@ -2608,6 +2857,274 @@ def command_text(fn, job_id: str) -> str:
         return fn(job_id).strip() or "No output."
     except SlurmError as exc:
         return str(exc)
+
+
+def fairshare_style(value: float | None) -> tuple[str, str]:
+    """Color style + label for a fairshare score.
+
+    Fairshare runs 0..1 where 1.0 means untouched / top scheduling priority and
+    values near 0 mean heavy recent use / low priority.
+    """
+    if value is None:
+        return "muted", ""
+    if value >= 0.5:
+        return "good", "high priority"
+    if value >= 0.125:
+        return "warn", "normal"
+    return "bad", "low priority"
+
+
+def build_user_info_lines(
+    user: str,
+    snapshot: dict,
+    spinner: str = "",
+) -> list[list[tuple[str, str]]]:
+    """Build the colored, segmented rows for the Info tab.
+
+    Pure by design: it takes a plain snapshot dict (as produced by
+    ``_info_snapshot``) and returns rows of ``(text, style)`` tuples so it can be
+    unit-tested without curses. ``spinner`` is the animation frame drawn while a
+    section is still loading.
+    """
+    rows: list[list[tuple[str, str]]] = []
+
+    def blank() -> None:
+        rows.append([("", "muted")])
+
+    status = snapshot.get("status", "idle")
+    default = snapshot.get("default", "")
+
+    # Header ------------------------------------------------------------
+    rows.append([("USER   ", "muted"), (user, "title")])
+    if default:
+        rows.append([("GROUP  ", "muted"), (default, "muted"), ("  primary", "muted")])
+    blank()
+
+    if status in {"idle", "loading"}:
+        rows.append([(f"{spinner} loading your VACC info".strip(), "muted")])
+        return rows
+
+    # Fairshare ---------------------------------------------------------
+    rows.append([("fairshare", "heading")])
+    fairshare = snapshot.get("fairshare", {}) or {}
+    if snapshot.get("accounts_error") and not fairshare:
+        rows.append([("  ", "muted"), ("unavailable", "bad")])
+    elif not fairshare:
+        rows.append([("  ", "muted"), ("no account associations found", "muted")])
+    else:
+        for account in sorted(fairshare, key=lambda name: (name != default, name)):
+            score = fairshare[account]
+            style, label = fairshare_style(score)
+            rows.append(
+                [
+                    ("  ", "muted"),
+                    (f"{account:<16}", "muted"),
+                    (format_fairshare(score), style),
+                    ("   ", "muted"),
+                    (label, style),
+                ]
+            )
+    blank()
+
+    # Compute usage (exact hours, no bars) ------------------------------
+    rows.append([("compute usage", "heading")])
+    rows.append(
+        [
+            ("  ", "muted"),
+            (f"{'':<15}", "muted"),
+            (f"{'CPU-hours':>12}", "cpu"),
+            ("   ", "muted"),
+            (f"{'GPU-hours':>12}", "gpu"),
+        ]
+    )
+    windows = snapshot.get("windows", {})
+    for window, label in USER_INFO_WINDOWS:
+        value = windows.get(window)
+        base = [("  ", "muted"), (f"{label:<15}", "muted")]
+        if value is None:
+            rows.append(base + [(f"{spinner} …".strip(), "muted")])
+        elif value == "error":
+            rows.append(base + [("unavailable", "bad")])
+        else:
+            cpu, gpu = value
+            rows.append(
+                base
+                + [
+                    (f"{cpu:>12,}", "muted"),
+                    ("   ", "muted"),
+                    (f"{gpu:>12,}", "muted"),
+                ]
+            )
+    blank()
+
+    # Storage (GPFS) ----------------------------------------------------
+    rows.extend(_gpfs_lines(snapshot, default, spinner))
+    blank()
+
+    # Job efficiency (last; each window streams in as it loads) ---------
+    rows.extend(_efficiency_lines(snapshot, spinner))
+    return rows
+
+
+def _efficiency_percent_cell(percent: float | None, width: int) -> str:
+    if percent is None:
+        return f"{'-':>{width}}"
+    return f"{percent:>{width - 1}.0f}%"
+
+
+def _efficiency_lines(snapshot: dict, spinner: str) -> list[list[tuple[str, str]]]:
+    """Job-efficiency table: one row per window, raw percentages + job count.
+
+    Each window (7d/30d/1y) loads independently, so a row shows a spinner until
+    its own sacct query returns. Values are used-vs-allocated percentages —
+    ``CPU`` = CPU-time used / allocated, ``memory`` = peak RSS / requested,
+    ``walltime`` = elapsed / time limit.
+    """
+    rows: list[list[tuple[str, str]]] = []
+    rows.append([("job efficiency", "heading"), ("  used / allocated", "muted")])
+    rows.append(
+        [
+            ("  ", "muted"),
+            (f"{'':<14}", "muted"),
+            (f"{'CPU':>7}", "muted"),
+            (f"{'memory':>9}", "muted"),
+            (f"{'walltime':>10}", "muted"),
+            (f"{'jobs':>9}", "muted"),
+        ]
+    )
+    efficiency = snapshot.get("efficiency", {}) or {}
+    for key, _window, label in JOB_EFFICIENCY_WINDOWS:
+        summary = efficiency.get(key)
+        base = [("  ", "muted"), (f"{label:<14}", "muted")]
+        if summary is None:
+            rows.append(base + [(f"{spinner} loading".strip(), "muted")])
+        elif summary == "error":
+            rows.append(base + [("unavailable", "bad")])
+        elif getattr(summary, "job_count", 0) == 0:
+            rows.append(base + [("no finished jobs", "muted")])
+        else:
+            rows.append(
+                base
+                + [
+                    (_efficiency_percent_cell(summary.cpu_percent, 7), "muted"),
+                    (_efficiency_percent_cell(summary.mem_percent, 9), "muted"),
+                    (_efficiency_percent_cell(summary.walltime_percent, 10), "muted"),
+                    (f"{summary.job_count:>9,}", "muted"),
+                ]
+            )
+
+    detail = _efficiency_detail_lines(efficiency)
+    if detail:
+        rows.append([("", "muted")])
+        rows.extend(detail)
+    return rows
+
+
+def _efficiency_detail_lines(efficiency: dict) -> list[list[tuple[str, str]]]:
+    """Raw 'requested X but used Y' averages for the first window with data."""
+    summary = None
+    label = ""
+    for key, _window, window_label in JOB_EFFICIENCY_WINDOWS:
+        candidate = efficiency.get(key)
+        if getattr(candidate, "job_count", 0):
+            summary, label = candidate, window_label
+            break
+    if summary is None:
+        return []
+
+    def sentence(text: str) -> list[tuple[str, str]]:
+        return [("    ", "muted"), (text, "muted")]
+
+    rows: list[list[tuple[str, str]]] = [
+        [("  ", "muted"), (f"on average, per job over the {label}:", "muted")]
+    ]
+    if summary.cpu_alloc is not None and summary.cpu_used is not None:
+        rows.append(
+            sentence(
+                f"requested {summary.cpu_alloc:.1f} CPU cores but used "
+                f"{summary.cpu_used:.1f}"
+            )
+        )
+    if summary.mem_req_bytes is not None and summary.mem_used_bytes is not None:
+        rows.append(
+            sentence(
+                f"requested {human_bytes(summary.mem_req_bytes)} of memory but "
+                f"used {human_bytes(summary.mem_used_bytes)}"
+            )
+        )
+    if summary.walltime_limit_sec is not None and summary.walltime_used_sec is not None:
+        rows.append(
+            sentence(
+                f"requested {human_duration(summary.walltime_limit_sec)} of "
+                f"walltime but used {human_duration(summary.walltime_used_sec)}"
+            )
+        )
+    return rows
+
+
+def _gpfs_lines(
+    snapshot: dict,
+    default: str,
+    spinner: str,
+) -> list[list[tuple[str, str]]]:
+    rows: list[list[tuple[str, str]]] = []
+    gpfs = snapshot.get("gpfs")
+    group = getattr(gpfs, "primary_group", "") or default
+    rows.append(
+        [("storage", "heading")]
+        + ([("  ", "muted"), (f"{group} group", "muted")] if group else [])
+    )
+    if gpfs is None:
+        if snapshot.get("gpfs_error"):
+            rows.append([("  ", "muted"), ("unavailable", "bad")])
+        else:
+            rows.append([("  ", "muted"), (f"{spinner} …".strip(), "muted")])
+        return rows
+
+    for filesystem, used, quota, _limit in gpfs.group_space:
+        percent = storage_percent(used, quota)
+        if percent is None:
+            percent_style, percent_text = "muted", ""
+        else:
+            percent_text = f"({percent:.0f}%)"
+            if percent >= 90:
+                percent_style = "bad"
+            elif percent >= 75:
+                percent_style = "warn"
+            else:
+                percent_style = "good"
+        rows.append(
+            [
+                ("  ", "muted"),
+                (f"{filesystem:<10}", "muted"),
+                (f"{used:>9} / {quota:<8}", "muted"),
+                ("  ", "muted"),
+                (percent_text, percent_style),
+            ]
+        )
+
+    merged: dict[str, dict[str, str]] = {}
+    for filesystem, used in gpfs.personal_space:
+        merged.setdefault(filesystem, {})["space"] = used
+    for filesystem, files in gpfs.personal_files:
+        merged.setdefault(filesystem, {})["files"] = files
+    if merged:
+        rows.append([("", "muted")])
+        rows.append([("  ", "muted"), ("your usage", "muted")])
+        for filesystem in sorted(merged):
+            space = merged[filesystem].get("space", "-")
+            files = merged[filesystem].get("files", "-")
+            files_text = f"{int(files):,}" if files.isdigit() else files
+            rows.append(
+                [
+                    ("  ", "muted"),
+                    (f"{filesystem:<10}", "muted"),
+                    (f"{space:>9}", "muted"),
+                    ("   ", "muted"),
+                    (f"{files_text:>13} files", "muted"),
+                ]
+            )
+    return rows
 
 
 def filter_choice_options(options: list[str], query: str) -> list[str]:
