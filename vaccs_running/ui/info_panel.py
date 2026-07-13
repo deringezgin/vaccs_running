@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .slurm import (
+from ..slurm import (
     JOB_EFFICIENCY_WINDOWS,
     USER_INFO_WINDOWS,
     format_fairshare,

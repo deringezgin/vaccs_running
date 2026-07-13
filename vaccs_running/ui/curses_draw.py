@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import curses
 
-from .ui_constants import (
+from .constants import (
     BORDER_PAIR,
     NODE_COLORS,
     STATE_COLORS,
 )
-from .slurm import Node
+from ..slurm import Node
 
 
 class CursesMixin:

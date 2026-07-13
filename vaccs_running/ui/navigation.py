@@ -3,7 +3,7 @@ from __future__ import annotations
 import curses
 
 from .summaries import filter_running_jobs
-from .slurm import (
+from ..slurm import (
     Job,
     JobRecordGroup,
     Node,

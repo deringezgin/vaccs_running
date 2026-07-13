@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from .slurm import Job
-from .ui_constants import (
+from ..slurm import Job
+from .constants import (
     JOB_STATE_CODES,
     JOB_STATE_FILTER_OPTIONS,
     LEADERBOARD_MIN_HEIGHT,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import curses
 
-from .ui_constants import MUTED_PAIR
+from .constants import MUTED_PAIR
 from .widgets import (
     pct,
     resource_count_width,
@@ -24,7 +24,7 @@ from .summaries import (
     status_title,
     summary_title,
 )
-from .slurm import (
+from ..slurm import (
     Job,
     JobRecordGroup,
     Node,

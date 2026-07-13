@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import curses
 
-from .ui_constants import (
+from .constants import (
     LEADERBOARD_GRID_TOP,
     LEADERBOARD_MIN_HEIGHT,
     LEADERBOARD_MIN_WIDTH,
     MUTED_PAIR,
 )
 from .table_layout import leaderboard_columns
-from .slurm import (
+from ..slurm import (
     LEADERBOARD_WINDOWS,
     LeaderboardRow,
     format_fairshare,

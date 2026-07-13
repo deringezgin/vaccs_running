@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from .ui_constants import JOB_STATE_CODES
-from .slurm import plural_label
+from .constants import JOB_STATE_CODES
+from ..slurm import plural_label
 
 
 class JobFilterStateMixin:

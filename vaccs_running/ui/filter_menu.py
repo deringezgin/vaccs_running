@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import curses
 
-from .ui_constants import (
+from .constants import (
     ACTIVE_TAB_PAIR,
     JOB_STATE_FILTER_OPTIONS,
     MUTED_PAIR,
@@ -14,7 +14,7 @@ from .curses_compat import (
     safe_getmouse,
     safe_mousemask,
 )
-from .slurm import (
+from ..slurm import (
     JobFilterChoices,
     SlurmError,
     VACC_PARTITIONS,

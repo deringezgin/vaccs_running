@@ -3,7 +3,7 @@ from __future__ import annotations
 import curses
 import time
 
-from .ui_constants import (
+from .constants import (
     ACTIVE_TAB_PAIR,
     HISTORY_FILTER_OPTIONS,
     INFO_TOP,

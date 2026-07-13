@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import curses
 
-from .ui_constants import (
+from .constants import (
     HISTORY_FILTER_OPTIONS,
     LEADERBOARD_PAGE,
 )
-from .slurm import (
+from ..slurm import (
     HISTORY_WINDOWS,
     LEADERBOARD_SORTS,
     LEADERBOARD_SORT_LABELS,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from .slurm import Job, JobRecordGroup
+from ..slurm import Job, JobRecordGroup
 
 
 def leaderboard_columns(

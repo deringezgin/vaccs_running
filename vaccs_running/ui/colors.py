@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import curses
 
-from .ui_constants import (
+from .constants import (
     ACTIVE_TAB_PAIR,
     BORDER_PAIR,
     MUTED_PAIR,

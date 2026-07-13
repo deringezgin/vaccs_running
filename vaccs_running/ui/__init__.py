@@ -6,29 +6,29 @@ import time
 from dataclasses import dataclass
 
 # --- re-exported leaf helper modules (facade) ---
-from .ui_constants import *  # noqa: F401,F403
+from .constants import *  # noqa: F401,F403
 from .widgets import *  # noqa: F401,F403
 from .text_layout import *  # noqa: F401,F403
 from .table_layout import *  # noqa: F401,F403
 from .summaries import *  # noqa: F401,F403
 from .info_panel import *  # noqa: F401,F403
 from .curses_compat import *  # noqa: F401,F403
-from .ui_filter_menu import JobFilterMenuMixin
-from .ui_keys import KeyHandlingMixin
-from .ui_popups import PopupMixin, command_text  # noqa: F401 (re-export)
-from .ui_render_frame import RenderFrameMixin
-from .ui_render_tables import RenderTablesMixin
-from .ui_render_detail import RenderDetailMixin
-from .ui_render_leaderboard import RenderLeaderboardMixin
-from .ui_leaderboard_data import LeaderboardDataMixin
-from .ui_info_data import InfoDataMixin
-from .ui_filter_state import JobFilterStateMixin
-from .ui_navigation import NavigationMixin
-from .ui_refresh import RefreshMixin
-from .ui_curses import CursesMixin
-from .ui_colors import ColorMixin
+from .filter_menu import JobFilterMenuMixin
+from .keys import KeyHandlingMixin
+from .popups import PopupMixin, command_text  # noqa: F401 (re-export)
+from .render_frame import RenderFrameMixin
+from .render_tables import RenderTablesMixin
+from .render_detail import RenderDetailMixin
+from .render_leaderboard import RenderLeaderboardMixin
+from .leaderboard_data import LeaderboardDataMixin
+from .info_data import InfoDataMixin
+from .filter_state import JobFilterStateMixin
+from .navigation import NavigationMixin
+from .refresh import RefreshMixin
+from .curses_draw import CursesMixin
+from .colors import ColorMixin
 
-from .slurm import (
+from ..slurm import (
     LEADERBOARD_WINDOWS,
     Job,
     JobRecord,

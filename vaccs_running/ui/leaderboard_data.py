@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 
-from .slurm import (
+from ..slurm import (
     LEADERBOARD_WINDOWS,
     LeaderboardRow,
     SlurmError,

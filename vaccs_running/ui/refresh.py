@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 
-from .slurm import SlurmError
+from ..slurm import SlurmError
 
 
 class RefreshMixin:

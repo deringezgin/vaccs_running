@@ -9,7 +9,7 @@ from .text_layout import (
     popup_geometry,
     wrap_lines,
 )
-from .slurm import (
+from ..slurm import (
     SlurmError,
     format_job_efficiency,
 )
