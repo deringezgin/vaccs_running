@@ -47,7 +47,7 @@ from .parsers import (
     parse_scontrol_nodes,
     parse_squeue_line,
     parse_sreport_usage,
-    parse_sshare_fairshare,
+    parse_sshare_scores,
     record_from_job,
     summarize_job_efficiency,
 )
@@ -388,18 +388,25 @@ class SlurmClient:
 
     def fetch_fairshare(self) -> dict[tuple[str, str], float]:
         """Current fairshare score keyed by (user, account) association."""
+        return self.fetch_fairshare_data()[0]
+
+    def fetch_fairshare_data(
+        self,
+    ) -> tuple[dict[tuple[str, str], float], dict[str, float]]:
+        """Native user FairShare and account LevelFS from one sshare query."""
         output = self.runner.run(
             [
                 "sshare",
                 "-a",
                 "-h",
                 "-P",
+                "-l",
                 "-o",
                 SSHARE_FAIRSHARE_FORMAT,
             ],
             timeout=30.0,
         )
-        return parse_sshare_fairshare(output)
+        return parse_sshare_scores(output)
 
     def fetch_default_accounts(self) -> dict[str, str]:
         """Default Slurm account keyed by user (best effort)."""

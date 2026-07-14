@@ -106,10 +106,10 @@ class KeyHandlingMixin:
             else:
                 self.state.message = "info still loading"
             return True
-        if key in (curses.KEY_DOWN, ord("j")):
+        if key == curses.KEY_DOWN:
             self.state.info_scroll += 1
             return True
-        if key in (curses.KEY_UP, ord("k")):
+        if key == curses.KEY_UP:
             self.state.info_scroll = max(0, self.state.info_scroll - 1)
             return True
         if key == curses.KEY_NPAGE:

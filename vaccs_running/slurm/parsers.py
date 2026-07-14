@@ -15,6 +15,7 @@ from .primitives import (
     parse_float,
     parse_int,
     parse_key_values,
+    parse_level_fairshare_value,
     parse_reqmem_bytes,
     parse_storage_size,
     parse_tres_value,
@@ -359,23 +360,30 @@ def parse_sreport_usage(output: str) -> list[UsageEntry]:
 
 
 def parse_sshare_fairshare(output: str) -> dict[tuple[str, str], float]:
-    """Map (user, account) -> fairshare from parseable sshare output.
+    """Map (user, account) -> FairShare from parseable sshare output."""
+    return parse_sshare_scores(output)[0]
 
-    Account-level rows (empty user) are skipped; sshare indents its columns so
-    every field is stripped before use.
-    """
-    scores: dict[tuple[str, str], float] = {}
+
+def parse_sshare_scores(
+    output: str,
+) -> tuple[dict[tuple[str, str], float], dict[str, float]]:
+    """Parse native user FairShare and account LevelFS from one sshare result."""
+    fairshare: dict[tuple[str, str], float] = {}
+    level_fairshare: dict[str, float] = {}
     for line in output.splitlines():
         if not line.strip():
             continue
         parts = line.split("|")
-        if len(parts) < 3:
+        if len(parts) < 4:
             continue
         user = parts[0].strip()
         account = parts[1].strip()
-        if not user:
-            continue
-        fairshare = parse_fairshare_value(parts[2])
-        if fairshare is not None:
-            scores[(user, account)] = fairshare
-    return scores
+        if user:
+            score = parse_fairshare_value(parts[2])
+            if score is not None:
+                fairshare[(user, account)] = score
+        elif account:
+            score = parse_level_fairshare_value(parts[3])
+            if score is not None:
+                level_fairshare[account] = score
+    return fairshare, level_fairshare

@@ -148,6 +148,11 @@ terminal) it shows a "needs a bigger screen" notice instead of a broken layout,
 and on narrow-but-valid widths it drops the fairshare, then the group, column to
 keep the core numbers legible.
 
+In user mode, FS is the user's native Slurm FairShare for their default account.
+In group mode, LevelFS is Slurm's native account-level fairshare relative to
+sibling accounts; values above 1 are underserved, values below 1 are overserved,
+and an account with no usage is shown as `∞`.
+
 </details>
 
 <details>

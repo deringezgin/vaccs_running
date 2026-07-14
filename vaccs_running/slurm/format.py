@@ -101,4 +101,6 @@ def human_hours(value: int) -> str:
 def format_fairshare(value: float | None) -> str:
     if value is None:
         return "-"
+    if value == float("inf"):
+        return "∞"
     return f"{value:.5f}".rstrip("0").rstrip(".")

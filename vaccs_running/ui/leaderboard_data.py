@@ -35,6 +35,7 @@ class LeaderboardDataMixin:
             # Drop the old fairshare so refreshed usage never renders against a
             # previous generation's scores (or stale scores if sshare later fails).
             self._lb_fairshare = {}
+            self._lb_level_fairshare = {}
             self._lb_default_accounts = {}
             for window, _label in LEADERBOARD_WINDOWS:
                 self._lb_windows[window] = {
@@ -74,14 +75,16 @@ class LeaderboardDataMixin:
 
     def _fetch_leaderboard_fairshare(self, generation: int) -> None:
         try:
-            fairshare = self.client.fetch_fairshare()
+            fairshare, level_fairshare = self.client.fetch_fairshare_data()
             default_accounts = self.client.fetch_default_accounts()
         except Exception:
             fairshare = None
+            level_fairshare = None
             default_accounts = None
         with self._lb_lock:
             if generation == self._lb_generation and fairshare is not None:
                 self._lb_fairshare = fairshare
+                self._lb_level_fairshare = level_fairshare or {}
                 self._lb_default_accounts = default_accounts or {}
 
     def _leaderboard_snapshot(self) -> dict[str, dict[str, object]]:
@@ -91,6 +94,7 @@ class LeaderboardDataMixin:
                 window: dict(info) for window, info in self._lb_windows.items()
             }
             fairshare = dict(self._lb_fairshare)
+            level_fairshare = dict(self._lb_level_fairshare)
             default_accounts = dict(self._lb_default_accounts)
         needle = self.state.leaderboard_filter.strip().lower()
         snapshot: dict[str, dict[str, object]] = {}
@@ -104,7 +108,10 @@ class LeaderboardDataMixin:
             rows: list[tuple[int, LeaderboardRow]] = []
             if info["status"] == "ready":
                 if self.state.leaderboard_group_mode:
-                    leaderboard = build_group_leaderboard(info["usage"], fairshare)
+                    leaderboard = build_group_leaderboard(
+                        info["usage"],
+                        level_fairshare,
+                    )
                 else:
                     leaderboard = build_user_leaderboard(
                         info["usage"],

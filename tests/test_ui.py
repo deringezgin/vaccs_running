@@ -64,6 +64,9 @@ class FakeClient:
     def fetch_fairshare(self):
         return {}
 
+    def fetch_fairshare_data(self):
+        return self.fetch_fairshare(), {}
+
     def fetch_default_accounts(self):
         return {}
 
@@ -126,9 +129,12 @@ class LeaderboardClient(FakeClient):
             UsageEntry("", "root", 99999, 9999),  # cluster total, never shown
         ]
 
-    def fetch_fairshare(self):
+    def fetch_fairshare_data(self):
         self.fairshare_calls += 1
-        return {("alice", "pi-x"): 0.42, ("bob", "pi-x"): 0.90}
+        return (
+            {("alice", "pi-x"): 0.42, ("bob", "pi-x"): 0.90},
+            {"pi-x": 0.125},
+        )
 
     def fetch_default_accounts(self):
         self.default_account_calls += 1
@@ -1941,6 +1947,8 @@ class LeaderboardTests(unittest.TestCase):
         written = rendered_text(screen)
         self.assertIn("GROUP", written)
         self.assertIn("pi-x", written)
+        self.assertIn("LevelFS", written)
+        self.assertIn("0.125", written)
         self.assertNotIn("root", written)
 
     def test_draw_leaderboard_shows_loading_and_error_panes(self):
@@ -2049,6 +2057,7 @@ class LeaderboardTests(unittest.TestCase):
             app._lb_generation += 1
             app._lb_windows["24h"] = {"status": "loading", "usage": [], "error": ""}
             app._lb_fairshare = {}
+            app._lb_level_fairshare = {}
             app._lb_default_accounts = {}
         stale = app._lb_generation - 1
 
@@ -2058,6 +2067,7 @@ class LeaderboardTests(unittest.TestCase):
         with app._lb_lock:
             self.assertEqual(app._lb_windows["24h"]["status"], "loading")
             self.assertEqual(app._lb_fairshare, {})
+            self.assertEqual(app._lb_level_fairshare, {})
             self.assertEqual(app._lb_default_accounts, {})
 
         # A current-generation result is accepted.
@@ -2066,6 +2076,7 @@ class LeaderboardTests(unittest.TestCase):
         with app._lb_lock:
             self.assertEqual(app._lb_windows["24h"]["status"], "ready")
             self.assertTrue(app._lb_fairshare)
+            self.assertTrue(app._lb_level_fairshare)
             self.assertTrue(app._lb_default_accounts)
 
     def _open_find(self, client=None):
@@ -2413,19 +2424,26 @@ class UserInfoTests(unittest.TestCase):
         self.assertEqual(snapshot["gpfs"].primary_group, "pi-test")
         self.assertEqual(snapshot["efficiency"]["7d"].job_count, 5)
 
-    def test_r_refreshes_info_and_scroll_keys_move_the_offset(self):
+    def test_r_refreshes_info_and_arrow_keys_move_the_offset(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="info")
         app.state.info_scroll = 0
 
-        self.assertTrue(app._handle_info_key(ord("j")))
+        self.assertTrue(app._handle_info_key(curses.KEY_DOWN))
         self.assertEqual(app.state.info_scroll, 1)
-        self.assertTrue(app._handle_info_key(ord("k")))
+        self.assertTrue(app._handle_info_key(curses.KEY_UP))
         self.assertEqual(app.state.info_scroll, 0)
         self.assertTrue(app._handle_info_key(ord("r")))
         # 'r' triggers a refresh; the message reflects it.
         self.assertIn("info", app.state.message)
         # Tab-switch keys are NOT consumed by the info handler.
+        self.assertFalse(app._handle_info_key(ord("j")))
         self.assertFalse(app._handle_info_key(ord("n")))
+
+    def test_j_switches_from_info_to_jobs(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="info")
+
+        self.assertTrue(app._handle_key(None, ord("j")))
+        self.assertEqual(app.state.view, "jobs")
 
     def test_header_shows_info_tab(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="info")

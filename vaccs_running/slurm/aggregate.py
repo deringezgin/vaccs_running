@@ -8,7 +8,6 @@ from .constants import (
     ROOT_ACCOUNT,
 )
 from .primitives import (
-    _group_fairshare,
     _user_fairshare,
     dominant_account,
     is_slurm_timestamp,
@@ -450,9 +449,9 @@ def build_user_leaderboard(
 
 def build_group_leaderboard(
     usage: Iterable[UsageEntry],
-    fairshare: dict[tuple[str, str], float] | None = None,
+    level_fairshare: dict[str, float] | None = None,
 ) -> list[LeaderboardRow]:
-    """Per-account rows, using sreport's account-total rows for usage."""
+    """Per-account usage rows with Slurm-native account LevelFS."""
     per_group: dict[str, dict[str, int]] = {}
     for entry in usage:
         if entry.login:
@@ -462,13 +461,13 @@ def build_group_leaderboard(
         row = per_group.setdefault(entry.account, {"cpu": 0, "gpu": 0})
         row["cpu"] += entry.cpu_hours
         row["gpu"] += entry.gpu_hours
-    fairshare_by_group = _group_fairshare(fairshare or {})
+    level_fairshare = level_fairshare or {}
     return [
         LeaderboardRow(
             name=account,
             cpu_hours=row["cpu"],
             gpu_hours=row["gpu"],
-            fairshare=fairshare_by_group.get(account),
+            fairshare=level_fairshare.get(account),
         )
         for account, row in per_group.items()
     ]

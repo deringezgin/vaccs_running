@@ -150,7 +150,13 @@ class RenderLeaderboardMixin:
         user_mode = not self.state.leaderboard_group_mode
         entity = "USER" if user_mode else "GROUP"
         # Show each user's PI group only in user mode (group rows are groups).
-        columns = leaderboard_columns(inner_width, entity, max_rank, group_col=user_mode)
+        columns = leaderboard_columns(
+            inner_width,
+            entity,
+            max_rank,
+            group_col=user_mode,
+            fairshare_label="FS" if user_mode else "LevelFS",
+        )
         self._draw_leaderboard_row(
             stdscr,
             top + 1,

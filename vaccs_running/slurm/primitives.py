@@ -257,6 +257,14 @@ def parse_fairshare_value(value: str) -> float | None:
     return parsed
 
 
+def parse_level_fairshare_value(value: str) -> float | None:
+    """Parse Slurm LevelFS, preserving its native infinity value."""
+    stripped = value.strip()
+    if stripped.lower() in {"inf", "+inf", "infinity", "+infinity"}:
+        return float("inf")
+    return parse_fairshare_value(stripped)
+
+
 def _user_fairshare(
     fairshare: dict[tuple[str, str], float],
     default_accounts: dict[str, str],
@@ -266,18 +274,6 @@ def _user_fairshare(
         user: fairshare[(user, account)]
         for user, account in default_accounts.items()
         if account and (user, account) in fairshare
-    }
-
-
-def _group_fairshare(fairshare: dict[tuple[str, str], float]) -> dict[str, float]:
-    """Mean fairshare of each account's member users."""
-    members: dict[str, list[float]] = {}
-    for (_user, account), score in fairshare.items():
-        members.setdefault(account, []).append(score)
-    return {
-        account: sum(scores) / len(scores)
-        for account, scores in members.items()
-        if scores
     }
 
 

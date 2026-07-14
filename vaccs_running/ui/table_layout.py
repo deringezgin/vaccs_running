@@ -10,6 +10,7 @@ def leaderboard_columns(
     entity_label: str,
     max_rank: int = 1,
     group_col: bool = False,
+    fairshare_label: str = "FS",
 ) -> list[tuple[str, str, int, str]]:
     """Columns for one leaderboard pane, given its usable inner width.
 
@@ -45,7 +46,7 @@ def leaderboard_columns(
             cols.append(("group", "GROUP", group_w, "l"))
         cols += [("cpu", "CPUh", cpu_w, "r"), ("gpu", "GPUh", gpu_w, "r")]
         if with_fs:
-            cols.append(("fs", "FS", fs_w, "r"))
+            cols.append(("fs", fairshare_label, fs_w, "r"))
         return cols
 
     # Ultra-narrow fallback: rank/name/cpu/gpu with the name squeezed down.

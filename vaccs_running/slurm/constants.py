@@ -101,7 +101,7 @@ SREPORT_USAGE_FORMAT = "Login,Account,TresName,Used"
 SREPORT_USAGE_REPORT = "AccountUtilizationByUser"
 
 
-SSHARE_FAIRSHARE_FORMAT = "User,Account,FairShare"
+SSHARE_FAIRSHARE_FORMAT = "User,Account,FairShare,LevelFS"
 
 
 USAGE_TRES = "cpu,gres/gpu"

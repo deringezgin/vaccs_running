@@ -122,6 +122,7 @@ class VaccsRunningApp(
             for window, _label in LEADERBOARD_WINDOWS
         }
         self._lb_fairshare: dict[tuple[str, str], float] = {}
+        self._lb_level_fairshare: dict[str, float] = {}
         self._lb_default_accounts: dict[str, str] = {}
 
         # The Info tab loads its user card (accounts, fairshare, per-window

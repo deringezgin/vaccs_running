@@ -42,11 +42,13 @@ from vaccs_running.slurm import (
     history_start,
     parse_sacct_line,
     parse_fairshare_value,
+    parse_level_fairshare_value,
     parse_node_job_line,
     parse_scontrol_nodes,
     parse_scontrol_job_usage,
     parse_sreport_usage,
     parse_sshare_fairshare,
+    parse_sshare_scores,
     parse_squeue_line,
     parse_elapsed_seconds,
     parse_gpu_count,
@@ -1003,17 +1005,17 @@ SREPORT_SAMPLE = "\n".join(
     ]
 )
 
-# Real 3-column sshare output: account rows have an empty user and no fairshare,
+# Real 4-column sshare output: account rows have LevelFS but no user FairShare,
 # and sshare indents the Account column even in parseable mode.
 SSHARE_SAMPLE = "\n".join(
     [
-        "|root|",
-        "root| root|1.000000",
-        "| pi-alwoodwa|",
-        "jstonge1|  pi-alwoodwa|0.812345",
-        "mvarnold|  pi-alwoodwa|0.912345",
-        "| pi-aelledge|",
-        "bhimberg|  pi-aelledge|0.123456",
+        "|root||",
+        "root| root|1.000000|inf",
+        "| pi-alwoodwa||0.750000",
+        "jstonge1|  pi-alwoodwa|0.812345|1.500000",
+        "mvarnold|  pi-alwoodwa|0.912345|0.500000",
+        "| pi-aelledge||inf",
+        "bhimberg|  pi-aelledge|0.123456|0.250000",
     ]
 )
 
@@ -1053,11 +1055,24 @@ class LeaderboardParsingTests(unittest.TestCase):
             },
         )
 
+    def test_parse_sshare_scores_keeps_native_account_level_fairshare(self):
+        fairshare, level_fairshare = parse_sshare_scores(SSHARE_SAMPLE)
+
+        self.assertEqual(fairshare[("jstonge1", "pi-alwoodwa")], 0.812345)
+        self.assertEqual(level_fairshare["pi-alwoodwa"], 0.75)
+        self.assertEqual(level_fairshare["pi-aelledge"], float("inf"))
+        self.assertNotIn("root", level_fairshare)
+
     def test_parse_fairshare_value_handles_blanks_and_inf(self):
         self.assertIsNone(parse_fairshare_value(""))
         self.assertIsNone(parse_fairshare_value("inf"))
         self.assertIsNone(parse_fairshare_value("nonsense"))
         self.assertEqual(parse_fairshare_value(" 0.5 "), 0.5)
+
+    def test_parse_level_fairshare_value_preserves_positive_infinity(self):
+        self.assertEqual(parse_level_fairshare_value("inf"), float("inf"))
+        self.assertEqual(parse_level_fairshare_value(" 0.009805 "), 0.009805)
+        self.assertIsNone(parse_level_fairshare_value("nonsense"))
 
     def test_build_user_leaderboard_sums_usage_across_accounts(self):
         usage = [
@@ -1109,17 +1124,18 @@ class LeaderboardParsingTests(unittest.TestCase):
 
     def test_build_group_leaderboard_uses_account_rows_and_drops_root(self):
         entries = parse_sreport_usage(SREPORT_SAMPLE)
-        fairshare = parse_sshare_fairshare(SSHARE_SAMPLE)
-        rows = {r.name: r for r in build_group_leaderboard(entries, fairshare)}
+        _fairshare, level_fairshare = parse_sshare_scores(SSHARE_SAMPLE)
+        rows = {
+            r.name: r
+            for r in build_group_leaderboard(entries, level_fairshare)
+        }
 
         self.assertNotIn("root", rows)
         self.assertEqual(rows["pi-alwoodwa"].cpu_hours, 1601)
         self.assertEqual(rows["pi-aelledge"].gpu_hours, 811)
-        # Group fairshare is the mean of member users' scores.
-        self.assertAlmostEqual(
-            rows["pi-alwoodwa"].fairshare, (0.812345 + 0.912345) / 2
-        )
-        self.assertAlmostEqual(rows["pi-aelledge"].fairshare, 0.123456)
+        # Group scores are Slurm's native account LevelFS, not a user average.
+        self.assertEqual(rows["pi-alwoodwa"].fairshare, 0.75)
+        self.assertEqual(rows["pi-aelledge"].fairshare, float("inf"))
 
     def test_sort_leaderboard_orders_by_requested_metric_descending(self):
         rows = [
@@ -1170,6 +1186,7 @@ class LeaderboardParsingTests(unittest.TestCase):
 
     def test_format_fairshare_renders_dash_for_missing(self):
         self.assertEqual(format_fairshare(None), "-")
+        self.assertEqual(format_fairshare(float("inf")), "∞")
         self.assertEqual(format_fairshare(0.6806), "0.6806")
         self.assertEqual(format_fairshare(0.000736), "0.00074")
         self.assertEqual(format_fairshare(0.5), "0.5")
@@ -1203,18 +1220,35 @@ class LeaderboardClientTests(unittest.TestCase):
         self.assertIn(f"format={SREPORT_USAGE_FORMAT}", args)
         self.assertIn("Hours", args)
 
-    def test_fetch_fairshare_builds_sshare_command(self):
+    def test_fetch_fairshare_data_builds_one_native_sshare_command(self):
         client = SlurmClient(user="testuser")
         fake_runner = FakeRunner(SSHARE_SAMPLE)
         client.runner = fake_runner
 
-        scores = client.fetch_fairshare()
+        scores, level_scores = client.fetch_fairshare_data()
 
         self.assertEqual(scores[("jstonge1", "pi-alwoodwa")], 0.812345)
+        self.assertEqual(level_scores["pi-alwoodwa"], 0.75)
         self.assertEqual(
             fake_runner.calls[0][0],
-            ["sshare", "-a", "-h", "-P", "-o", SSHARE_FAIRSHARE_FORMAT],
+            [
+                "sshare",
+                "-a",
+                "-h",
+                "-P",
+                "-l",
+                "-o",
+                SSHARE_FAIRSHARE_FORMAT,
+            ],
         )
+
+    def test_fetch_fairshare_returns_user_scores_from_combined_query(self):
+        client = SlurmClient(user="testuser")
+        client.runner = FakeRunner(SSHARE_SAMPLE)
+
+        scores = client.fetch_fairshare()
+
+        self.assertEqual(scores[("bhimberg", "pi-aelledge")], 0.123456)
 
     def test_fetch_default_accounts_reads_all_users_from_sacctmgr(self):
         client = SlurmClient(user="testuser")
