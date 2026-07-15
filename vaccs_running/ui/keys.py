@@ -22,6 +22,19 @@ class KeyHandlingMixin:
             return True
         if key in (ord("q"), 27):
             return False
+        # View shortcuts are global. Handle them before view-local keys so a
+        # tab cannot accidentally consume its own escape route (for example,
+        # Info previously treated "j" as scroll-down instead of Jobs).
+        view_shortcuts = {
+            ord("n"): "nodes",
+            ord("h"): "history",
+            ord("j"): "jobs",
+            ord("u"): "leaderboard",
+            ord("i"): "info",
+        }
+        if key in view_shortcuts:
+            self._switch_view(view_shortcuts[key])
+            return True
         if self.state.view == "leaderboard" and self._handle_leaderboard_key(key):
             return True
         if self.state.view == "info" and self._handle_info_key(key):
@@ -42,16 +55,6 @@ class KeyHandlingMixin:
             self.state.selected = 0
         elif key == curses.KEY_END:
             self.state.selected = self._visible_count() - 1
-        elif key == ord("n"):
-            self._switch_view("nodes")
-        elif key == ord("h"):
-            self._switch_view("history")
-        elif key == ord("j"):
-            self._switch_view("jobs")
-        elif key == ord("u"):
-            self._switch_view("leaderboard")
-        elif key == ord("i"):
-            self._switch_view("info")
         elif key == ord("g"):
             if self.state.view == "nodes":
                 enabled = not self.state.gpu_nodes_only

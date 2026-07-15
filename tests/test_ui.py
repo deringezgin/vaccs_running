@@ -1,5 +1,6 @@
 import curses
 import unittest
+from unittest import mock
 
 from vaccs_running.slurm import (
     EfficiencySummary,
@@ -2439,11 +2440,14 @@ class UserInfoTests(unittest.TestCase):
         self.assertFalse(app._handle_info_key(ord("j")))
         self.assertFalse(app._handle_info_key(ord("n")))
 
-    def test_j_switches_from_info_to_jobs(self):
+    def test_j_switches_from_info_to_jobs_before_info_handler(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="info")
 
-        self.assertTrue(app._handle_key(None, ord("j")))
+        with mock.patch.object(app, "_handle_info_key") as info_handler:
+            self.assertTrue(app._handle_key(None, ord("j")))
+
         self.assertEqual(app.state.view, "jobs")
+        info_handler.assert_not_called()
 
     def test_header_shows_info_tab(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="info")
