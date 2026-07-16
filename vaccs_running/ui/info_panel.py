@@ -254,6 +254,33 @@ def _gpfs_lines(
             ]
         )
 
+    for filesystem, used, quota, limit in gpfs.group_files:
+        percent, percent_style = _file_quota_percent(used, quota)
+        soft_status, soft_style = _file_quota_remaining(used, quota, "soft")
+        hard_status, hard_style = _file_quota_remaining(used, limit, "hard")
+        used_text = _format_file_count(used)
+        quota_text = _format_file_count(quota)
+        rows.append(
+            [
+                ("  ", "muted"),
+                (f"{filesystem:<10}", "muted"),
+                ("files  ", "muted"),
+                (f"{used_text:>13} / {quota_text:<13}", "muted"),
+                (" soft", "muted"),
+                ("  ", "muted"),
+                (percent, percent_style),
+            ]
+        )
+        if soft_status or hard_status:
+            rows.append(
+                [
+                    (" " * 21, "muted"),
+                    (soft_status, soft_style),
+                    ("  ·  " if soft_status and hard_status else "", "muted"),
+                    (hard_status, hard_style),
+                ]
+            )
+
     merged: dict[str, dict[str, str]] = {}
     for filesystem, used in gpfs.personal_space:
         merged.setdefault(filesystem, {})["space"] = used
@@ -276,3 +303,41 @@ def _gpfs_lines(
                 ]
             )
     return rows
+
+
+def _parse_file_count(value: str) -> int | None:
+    try:
+        return int(value.replace(",", ""))
+    except (AttributeError, ValueError):
+        return None
+
+
+def _format_file_count(value: str) -> str:
+    parsed = _parse_file_count(value)
+    return f"{parsed:,}" if parsed is not None else value
+
+
+def _file_quota_percent(used: str, quota: str) -> tuple[str, str]:
+    used_count = _parse_file_count(used)
+    quota_count = _parse_file_count(quota)
+    if used_count is None or not quota_count:
+        return "", "muted"
+    percent = 100.0 * used_count / quota_count
+    if percent >= 90:
+        style = "bad"
+    elif percent >= 75:
+        style = "warn"
+    else:
+        style = "good"
+    return f"({percent:.0f}%)", style
+
+
+def _file_quota_remaining(used: str, limit: str, label: str) -> tuple[str, str]:
+    used_count = _parse_file_count(used)
+    limit_count = _parse_file_count(limit)
+    if used_count is None or not limit_count:
+        return "", "muted"
+    remaining = limit_count - used_count
+    if remaining >= 0:
+        return f"{remaining:,} {label} left", "muted"
+    return f"{-remaining:,} over {label}", "bad"

@@ -179,6 +179,7 @@ def parse_gpfs_quota(output: str, user: str = "") -> GpfsQuota:
     """
     primary = ""
     group_space: list[tuple[str, str, str, str]] = []
+    group_files: list[tuple[str, str, str, str]] = []
     personal_space: list[tuple[str, str]] = []
     personal_files: list[tuple[str, str]] = []
     section: str | None = None
@@ -212,6 +213,8 @@ def parse_gpfs_quota(output: str, user: str = "") -> GpfsQuota:
         tokens = line.split()
         if section == "group_space" and len(tokens) >= 5 and tokens[1].upper() == "GRP":
             group_space.append((tokens[0], tokens[2], tokens[3], tokens[4]))
+        elif section == "group_files" and len(tokens) >= 5 and tokens[1].upper() == "GRP":
+            group_files.append((tokens[0], tokens[2], tokens[3], tokens[4]))
         elif section == "personal_space" and len(tokens) >= 2:
             personal_space.append((tokens[0], tokens[1]))
         elif section == "personal_files" and len(tokens) >= 2:
@@ -219,6 +222,7 @@ def parse_gpfs_quota(output: str, user: str = "") -> GpfsQuota:
     return GpfsQuota(
         primary_group=primary,
         group_space=group_space,
+        group_files=group_files,
         personal_space=personal_space,
         personal_files=personal_files,
     )

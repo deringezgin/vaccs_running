@@ -631,11 +631,13 @@ class EfficiencySummary:
 class GpfsQuota:
     """Parsed ``my_gpfs_quota`` output for the info screen.
 
-    ``group_space`` rows are (filesystem, used, quota, limit); the personal rows
-    are (filesystem, value). All values keep their human units (e.g. '17.58T').
+    ``group_space`` and ``group_files`` rows are (filesystem, used, soft quota,
+    hard limit); the personal rows are (filesystem, value). Space values keep
+    their human units (e.g. '17.58T') and file counts remain decimal strings.
     """
 
     primary_group: str
     group_space: list[tuple[str, str, str, str]] = field(default_factory=list)
+    group_files: list[tuple[str, str, str, str]] = field(default_factory=list)
     personal_space: list[tuple[str, str]] = field(default_factory=list)
     personal_files: list[tuple[str, str]] = field(default_factory=list)

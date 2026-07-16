@@ -202,7 +202,8 @@ A one-screen card for **your** account on the cluster:
 - **Compute usage** — exact CPU-hours and GPU-hours over the **last 24 hours, 7
   days, 30 days, and 1 year** (per-user `sreport`, so even the year window is
   fast)
-- **Storage** — your PI group's GPFS space quota per filesystem (with % used),
+- **Storage** — your PI group's GPFS space and file-count quotas per filesystem,
+  including % used and how many files remain before the soft and hard limits,
   plus your own space and file counts (from `my_gpfs_quota`)
 - **Job efficiency** (shown last) — your average CPU, memory, and walltime
   efficiency (used vs allocated, the same figures `seff` reports) over the last

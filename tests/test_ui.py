@@ -99,6 +99,7 @@ class FakeClient:
         return GpfsQuota(
             primary_group="pi-test",
             group_space=[("gpfs1", "1T", "2T", "3T")],
+            group_files=[("gpfs1", "42", "100", "150")],
             personal_space=[("gpfs1", "500G")],
             personal_files=[("gpfs1", "42")],
         )
@@ -2316,6 +2317,10 @@ class UserInfoTests(unittest.TestCase):
         "gpfs": GpfsQuota(
             primary_group="pi-smith",
             group_space=[("gpfs1", "17.58T", "20T", "25T"), ("gpfs2", "1T", "35T", "45T")],
+            group_files=[
+                ("gpfs1", "6495522", "6291456", "12582912"),
+                ("gpfs2", "4000000", "8000000", "16000000"),
+            ],
             personal_space=[("gpfs1", "6.897T"), ("gpfs2", "32K")],
             personal_files=[("gpfs1", "1523523"), ("gpfs2", "17")],
         ),
@@ -2362,10 +2367,17 @@ class UserInfoTests(unittest.TestCase):
         self.assertIn("requested 4.0 CPU cores but used 1.1", blob)
         self.assertIn("requested 96G of memory but used 7.3G", blob)
         self.assertIn("walltime but used", blob)
-        # GPFS storage: group quota (with %) and personal usage.
+        # GPFS storage: group space and file quotas (with remaining counts),
+        # plus personal usage.
         self.assertIn("storage", blob)
         self.assertIn("17.58T / 20T", blob)
         self.assertIn("(88%)", blob)
+        self.assertIn("6,495,522 / 6,291,456", blob)
+        self.assertIn("(103%)", blob)
+        self.assertIn("204,066 over soft", blob)
+        self.assertIn("6,087,390 hard left", blob)
+        self.assertIn("4,000,000 soft left", blob)
+        self.assertIn("12,000,000 hard left", blob)
         self.assertIn("your usage", blob)
         self.assertIn("1,523,523 files", blob)
 

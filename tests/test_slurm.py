@@ -2145,7 +2145,7 @@ class GpfsQuotaTests(unittest.TestCase):
         quota = parse_gpfs_quota(GPFS_SAMPLE, user="dgezgin")
 
         self.assertEqual(quota.primary_group, "pi-ncheney")
-        # Group space keeps (filesystem, used, quota, limit); file limits are ignored.
+        # Both group blocks keep (filesystem, used, soft quota, hard limit).
         self.assertEqual(
             quota.group_space,
             [
@@ -2153,6 +2153,10 @@ class GpfsQuotaTests(unittest.TestCase):
                 ("gpfs2", "16.22T", "35T", "45T"),
                 ("gpfs3tmp", "1.219T", "7.812T", "7.891T"),
             ],
+        )
+        self.assertEqual(
+            quota.group_files,
+            [("gpfs1", "6495522", "6291456", "12582912")],
         )
         self.assertEqual(quota.personal_space, [("gpfs1", "6.897T"), ("gpfs2", "32K")])
         self.assertEqual(quota.personal_files, [("gpfs1", "1523523"), ("gpfs2", "17")])
