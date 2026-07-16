@@ -767,6 +767,10 @@ NodeName=h2node01 Arch=x86_64 CoresPerSocket=96
    Partitions=nvgpu
    AllocTRES=cpu=13,mem=194G,gres/gpu=1
 """,
+                """testuser| pi-test|0.680600|0.750000
+other| pi-other|0.125000|0.500000
+""",
+                "testuser|pi-test\nother|pi-other\n",
             ]
         )
         client.runner = fake_runner
@@ -781,11 +785,20 @@ NodeName=h2node01 Arch=x86_64 CoresPerSocket=96
             fake_runner.calls[1][0],
             ["scontrol", "show", "node"],
         )
+        self.assertEqual(fake_runner.calls[2][0][0], "sshare")
+        self.assertEqual(fake_runner.calls[3][0][0], "sacctmgr")
         self.assertIn("2 people running 2 tasks", output)
+        self.assertIn("FS", output)
         self.assertIn("testuser", output)
+        self.assertRegex(output, r"(?m)^testuser\s+1\s+4\s+1\s+16G\s+0\.6806$")
         self.assertIn("other", output)
+        stripped_output = "\n".join(line.rstrip() for line in output.splitlines())
+        self.assertRegex(
+            stripped_output,
+            r"(?m)^other\s+1\s+8\s+0\s+32G\s+0\.125$",
+        )
         self.assertIn("TOTAL", output)
-        self.assertRegex(output, r"(?m)^FREE\s+-\s+-\s+3")
+        self.assertRegex(stripped_output, r"(?m)^FREE\s+-\s+-\s+3\s+-\s+-$")
 
     def test_parse_node_job_line_strips_fields(self):
         job = parse_node_job_line(
@@ -916,6 +929,42 @@ NodeName=h2node01 Arch=x86_64 CoresPerSocket=96
 
         self.assertEqual(free_index, total_index + 1)
         self.assertRegex(lines[free_index].rstrip(), r"^FREE\s+-\s+-\s+7$")
+
+    def test_format_user_usage_shows_fairshare_for_each_user(self):
+        usage = aggregate_user_usage(
+            [
+                {
+                    "job_id": "1",
+                    "user": "alice",
+                    "cpus": "4",
+                    "tres": "cpu=4,gres/gpu=1",
+                    "memory": "N/A",
+                },
+                {
+                    "job_id": "2",
+                    "user": "bob",
+                    "cpus": "8",
+                    "tres": "cpu=8",
+                    "memory": "N/A",
+                },
+            ]
+        )
+
+        text = format_user_usage(
+            usage,
+            fairshare_by_user={"alice": 0.000736},
+        )
+        lines = text.splitlines()
+
+        self.assertIn("FS", lines[2])
+        self.assertRegex(
+            next(line for line in lines if line.startswith("alice")),
+            r"0\.00074$",
+        )
+        self.assertRegex(
+            next(line for line in lines if line.startswith("bob")).rstrip(),
+            r"-$",
+        )
 
     def test_format_user_usage_renders_allocated_row_before_free(self):
         usage = aggregate_user_usage(

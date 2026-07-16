@@ -24,6 +24,7 @@ from .format import (
     _cores_detail,
     _efficiency_report_line,
     _time_detail,
+    format_fairshare,
     human_mb,
 )
 from .models import (
@@ -320,6 +321,7 @@ def format_user_usage(
     usage: list[UserUsage],
     free_gpus: int | None = None,
     allocated_gpus: int | None = None,
+    fairshare_by_user: dict[str, float] | None = None,
 ) -> str:
     if not usage and free_gpus is None:
         return "No running tasks found."
@@ -337,6 +339,8 @@ def format_user_usage(
     ]
     if show_memory:
         columns.append(("memory", "RAM_ALLOC"))
+    if fairshare_by_user is not None:
+        columns.append(("fairshare", "FS"))
 
     rows: list[dict[str, str]] = []
     for row in usage:
@@ -350,6 +354,8 @@ def format_user_usage(
             values["memory"] = (
                 human_mb(row.memory_mb) if row.memory_mb is not None else "-"
             )
+        if fairshare_by_user is not None:
+            values["fairshare"] = format_fairshare(fairshare_by_user.get(row.user))
         rows.append(values)
 
     total = {
@@ -360,12 +366,16 @@ def format_user_usage(
     }
     if show_memory:
         total["memory"] = human_mb(total_memory)
+    if fairshare_by_user is not None:
+        total["fairshare"] = "-"
     rows.append(total)
 
     def summary_row(label: str, gpus: int) -> dict[str, str]:
         row = {"user": label, "tasks": "-", "cpus": "-", "gpus": str(gpus)}
         if show_memory:
             row["memory"] = "-"
+        if fairshare_by_user is not None:
+            row["fairshare"] = "-"
         return row
 
     if allocated_gpus is not None:

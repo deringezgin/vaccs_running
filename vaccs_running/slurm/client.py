@@ -24,6 +24,7 @@ from .constants import (
     VACC_PARTITIONS,
 )
 from .primitives import (
+    _user_fairshare,
     history_start,
     normalize_squeue_states,
     plural_label,
@@ -350,10 +351,21 @@ class SlurmClient:
         nodes = parse_scontrol_nodes(node_output)
         free_gpus = free_gpu_count(nodes)
         allocated_gpus = stranded_gpu_count(nodes)
+        fairshare_by_user: dict[str, float] = {}
+        try:
+            fairshare, _level_fairshare = self.fetch_fairshare_data()
+            fairshare_by_user = _user_fairshare(
+                fairshare,
+                self.fetch_default_accounts(),
+            )
+        except SlurmError:
+            # Live allocations are still useful if accounting is unavailable.
+            pass
         return format_user_usage(
             aggregate_user_usage(usage),
             free_gpus=free_gpus,
             allocated_gpus=allocated_gpus,
+            fairshare_by_user=fairshare_by_user,
         )
 
     def fetch_usage_window(
