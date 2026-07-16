@@ -3,12 +3,314 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import re
 
-from .constants import FAILED_STATES
+from .constants import FAILED_STATES, PRIORITY_RANKABLE_REASONS
 from .primitives import (
+    explain_pending_reason,
+    parse_elapsed_seconds,
     parse_gpu_count,
+    parse_memory_mb,
+    parse_optional_int,
+    parse_tres_value,
+    pending_reason_code,
     state_base,
 )
-from .format import human_mb
+from .format import human_duration, human_mb
+
+
+@dataclass(frozen=True)
+class PriorityFactors:
+    """Weighted ``sprio`` components behind one job's composite priority."""
+
+    priority: int | None = None
+    site: int | None = None
+    age: int | None = None
+    association: int | None = None
+    fairshare: int | None = None
+    job_size: int | None = None
+    partition: int | None = None
+    qos: int | None = None
+    tres: str = ""
+    nice: int | None = None
+
+
+@dataclass(frozen=True)
+class PriorityQueueJob:
+    """One pending job from the scheduler-order ``squeue`` snapshot."""
+
+    job_id: str
+    user: str
+    name: str
+    partition: str
+    state: str
+    reason: str
+    priority: int | None
+    account: str
+    qos: str
+    submit_time: str
+    start_time: str
+    reservation: str
+    node_count: str
+    cpus: str
+    gres: str
+    requested_tres: str
+    limit: str
+    factors: PriorityFactors | None = None
+
+    @property
+    def array_parent(self) -> str:
+        return self.job_id.split("_", 1)[0]
+
+    @property
+    def normalized_reservation(self) -> str:
+        value = self.reservation.strip()
+        if value.upper() in {"", "N/A", "NONE", "(NULL)"}:
+            return ""
+        return value
+
+    @property
+    def queue_label(self) -> str:
+        if not self.normalized_reservation:
+            return self.partition
+        return f"{self.partition}/{self.normalized_reservation}"
+
+    @property
+    def reason_code(self) -> str:
+        return pending_reason_code(self.reason)
+
+    @property
+    def reason_explanation(self) -> str:
+        return explain_pending_reason(self.reason)
+
+    @property
+    def is_rankable(self) -> bool:
+        """Whether a conservative priority-only rank is meaningful."""
+        return self.priority is not None and self.reason_code in PRIORITY_RANKABLE_REASONS
+
+    @property
+    def estimated_start(self) -> str:
+        value = self.start_time.strip()
+        if not value or value.upper() in {
+            "N/A",
+            "NONE",
+            "UNKNOWN",
+            "(NULL)",
+        }:
+            return "-"
+        return value
+
+    @property
+    def requested_resources(self) -> str:
+        if self.requested_tres and self.requested_tres.upper() not in {
+            "N/A",
+            "NONE",
+            "(NULL)",
+        }:
+            return self.requested_tres
+        resources: list[str] = []
+        if self.node_count and self.node_count not in {"0", "N/A", "(null)"}:
+            suffix = "node" if self.node_count == "1" else "nodes"
+            resources.append(f"{self.node_count} {suffix}")
+        if self.cpus and self.cpus not in {"0", "N/A", "(null)"}:
+            suffix = "CPU" if self.cpus == "1" else "CPUs"
+            resources.append(f"{self.cpus} {suffix}")
+        if self.gres and self.gres.upper() not in {"N/A", "NONE", "(NULL)"}:
+            resources.append(self.gres)
+        return ", ".join(resources) if resources else "not reported"
+
+    @property
+    def gpu_count(self) -> int:
+        return parse_gpu_count(self.requested_tres or self.gres)
+
+    @property
+    def requested_gpu_count(self) -> int | None:
+        """Requested GPUs, retaining unknown data instead of calling it zero."""
+        if self.requested_tres and self.requested_tres.upper() not in {
+            "N/A",
+            "NONE",
+            "(NULL)",
+        }:
+            return parse_gpu_count(self.requested_tres)
+        if self.gres and self.gres.upper() not in {"N/A", "NONE", "(NULL)"}:
+            return parse_gpu_count(self.gres)
+        return None
+
+    @property
+    def requested_cpu_count(self) -> int | None:
+        tres_cpus = parse_optional_int(parse_tres_value(self.requested_tres, "cpu"))
+        if tres_cpus is not None:
+            return tres_cpus
+        return parse_optional_int(self.cpus)
+
+    @property
+    def requested_memory_mb(self) -> int | None:
+        return parse_memory_mb(parse_tres_value(self.requested_tres, "mem"))
+
+    @property
+    def requested_walltime_seconds(self) -> int | None:
+        seconds = parse_elapsed_seconds(self.limit)
+        return seconds if seconds >= 0 else None
+
+
+@dataclass(frozen=True)
+class PriorityQueueEntry:
+    """A pending queue row plus its conservative priority-rank context."""
+
+    job: PriorityQueueJob
+    priority_rank: int | None
+    rank_total: int | None
+    rank_end: int | None = None
+    task_count: int = 1
+    task_job_ids: tuple[str, ...] = ()
+    group_job_ids: tuple[str, ...] = ()
+    group_names: tuple[str, ...] = ()
+    group_priorities: tuple[int, ...] = ()
+    group_reason_codes: tuple[str, ...] = ()
+    source_group_count: int = 1
+    ahead_count: int | None = None
+    ahead_user_count: int | None = None
+    ahead: tuple[PriorityQueueJob, ...] = ()
+    rank_note: str = ""
+    requested_gpus: int | None = None
+    requested_cpus: int | None = None
+    requested_memory_mb: int | None = None
+    walltime_min_seconds: int | None = None
+    walltime_max_seconds: int | None = None
+
+    @property
+    def ahead_users(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(job.user for job in self.ahead if job.user))
+
+    @property
+    def earlier_count(self) -> int:
+        if self.ahead_count is not None:
+            return self.ahead_count
+        return len(self.ahead)
+
+    @property
+    def earlier_user_count(self) -> int:
+        if self.ahead_user_count is not None:
+            return self.ahead_user_count
+        return len(self.ahead_users)
+
+    @property
+    def priority_rank_text(self) -> str:
+        if self.priority_rank is None or self.rank_total is None:
+            return "not ranked"
+        if self.rank_end is not None and self.rank_end != self.priority_rank:
+            return f"{self.priority_rank}-{self.rank_end} of {self.rank_total}"
+        return f"{self.priority_rank} of {self.rank_total}"
+
+    @property
+    def job_count(self) -> int:
+        if self.group_job_ids:
+            return len(self.group_job_ids)
+        parents = tuple(
+            dict.fromkeys(job_id.split("_", 1)[0] for job_id in self.task_job_ids)
+        )
+        return len(parents) or 1
+
+    @property
+    def is_multi_job_group(self) -> bool:
+        return self.job_count > 1
+
+    @property
+    def is_consecutive_user_group(self) -> bool:
+        return self.source_group_count > 1
+
+    @property
+    def display_name(self) -> str:
+        names = self.group_names or (self.job.name,)
+        return names[0] if len(names) == 1 else "mixed jobs"
+
+    @property
+    def display_priority(self) -> str:
+        priorities = self.group_priorities
+        if not priorities and self.job.priority is not None:
+            priorities = (self.job.priority,)
+        if not priorities:
+            return "-"
+        if len(priorities) == 1:
+            return str(priorities[0])
+        return f"{max(priorities)}-{min(priorities)}"
+
+    @property
+    def display_reason(self) -> str:
+        reasons = self.group_reason_codes or (self.job.reason_code or "Unknown",)
+        if len(reasons) == 1:
+            return reasons[0]
+        combined = "/".join(reasons)
+        return combined if len(combined) <= 24 else f"mixed ({len(reasons)})"
+
+    @property
+    def display_estimated_start(self) -> str:
+        if self.is_consecutive_user_group:
+            return "mixed"
+        return self.job.estimated_start
+
+    @property
+    def display_job_id(self) -> str:
+        if self.is_multi_job_group:
+            if self.task_count != self.job_count:
+                return f"{self.job_count} jobs / {self.task_count} tasks"
+            return f"{self.job_count} jobs"
+        if self.task_count <= 1:
+            return self.job.job_id
+        parent = self.job.array_parent
+        task_ids: list[int] = []
+        for job_id in self.task_job_ids:
+            job_parent, separator, task = job_id.partition("_")
+            if job_parent != parent or not separator or not task.isdigit():
+                return f"{parent} [{self.task_count} tasks]"
+            task_ids.append(int(task))
+        if not task_ids:
+            return f"{parent} [{self.task_count} tasks]"
+
+        task_ids.sort()
+        ranges: list[str] = []
+        start = previous = task_ids[0]
+        for task in task_ids[1:]:
+            if task == previous + 1:
+                previous = task
+                continue
+            ranges.append(str(start) if start == previous else f"{start}-{previous}")
+            start = previous = task
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        return f"{parent}_[{','.join(ranges)}]"
+
+    @property
+    def display_gpus(self) -> str:
+        return "-" if self.requested_gpus is None else str(self.requested_gpus)
+
+    @property
+    def display_cpus(self) -> str:
+        return "-" if self.requested_cpus is None else str(self.requested_cpus)
+
+    @property
+    def display_memory(self) -> str:
+        if self.requested_memory_mb is None:
+            return "-"
+        return human_mb(self.requested_memory_mb)
+
+    @property
+    def display_walltime(self) -> str:
+        if self.walltime_min_seconds is None or self.walltime_max_seconds is None:
+            return "-"
+        minimum = human_duration(self.walltime_min_seconds)
+        maximum = human_duration(self.walltime_max_seconds)
+        return minimum if minimum == maximum else f"{minimum}–{maximum}"
+
+
+@dataclass(frozen=True)
+class PriorityQueueSnapshot:
+    """Read-only pending-queue snapshot and the current user's queue context."""
+
+    user: str
+    pending_jobs: tuple[PriorityQueueJob, ...]
+    my_jobs: tuple[PriorityQueueEntry, ...]
+    factors_available: bool
+    all_entries: tuple[PriorityQueueEntry, ...] = ()
+    factors_error: str = ""
+    grouped_entries: tuple[PriorityQueueEntry, ...] = ()
 
 
 @dataclass(frozen=True)

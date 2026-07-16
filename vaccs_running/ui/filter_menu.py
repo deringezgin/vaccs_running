@@ -46,6 +46,78 @@ class JobFilterMenuMixin:
         except SlurmError:
             return JobFilterChoices(users=[], groups=[], partitions=list(VACC_PARTITIONS))
 
+    def _show_priority_filter(self, stdscr: curses.window) -> None:
+        choices = self._priority_filter_choices()
+        self._run_jobs_filter_menu(
+            stdscr,
+            "priority filter",
+            self._priority_filter_home_items,
+            lambda win, height, width, item: self._activate_priority_filter_home_item(
+                stdscr,
+                choices,
+                item,
+            ),
+            " enter/click open  c clear  q close ",
+            close_keys=(ord("f"),),
+            clear_fn=self._clear_priority_filters,
+        )
+
+    def _priority_filter_choices(self) -> JobFilterChoices:
+        partitions = list(VACC_PARTITIONS)
+        snapshot = self.state.priority_queue
+        if snapshot is not None:
+            partitions.extend(job.partition for job in snapshot.pending_jobs)
+        partitions.extend(self._selected_priority_partitions())
+        return JobFilterChoices(
+            users=[],
+            groups=[],
+            partitions=list(
+                dict.fromkeys(partition for partition in partitions if partition)
+            ),
+        )
+
+    def _priority_filter_home_items(self) -> list[dict[str, object]]:
+        return [
+            {
+                "kind": "submenu",
+                "action": "partition",
+                "label": (
+                    "Filter by partition: "
+                    f"{self._priority_partition_summary()}"
+                ),
+            }
+        ]
+
+    def _activate_priority_filter_home_item(
+        self,
+        stdscr: curses.window,
+        choices: JobFilterChoices,
+        item: dict[str, object],
+    ) -> None:
+        if item.get("action") == "partition":
+            self._show_priority_partition_filter(stdscr, choices)
+
+    def _show_priority_partition_filter(
+        self,
+        stdscr: curses.window,
+        choices: JobFilterChoices,
+    ) -> None:
+        self._run_jobs_filter_menu(
+            stdscr,
+            "filter by partition",
+            lambda: self._priority_partition_filter_items(choices),
+            lambda win, height, width, item: self._activate_priority_partition_filter_item(
+                win,
+                height,
+                width,
+                choices,
+                item,
+            ),
+            " enter/click select  c clear  q back ",
+            close_keys=(ord("f"),),
+            clear_fn=self._clear_priority_filters,
+        )
+
     def _run_jobs_filter_menu(
         self,
         stdscr: curses.window,
@@ -54,6 +126,7 @@ class JobFilterMenuMixin:
         activate_fn,
         footer: str,
         close_keys: tuple[int, ...] = (),
+        clear_fn=None,
     ) -> None:
         selected = 0
         scroll = 0
@@ -137,7 +210,7 @@ class JobFilterMenuMixin:
             elif key in (ord("\n"), curses.KEY_ENTER, ord(" ")):
                 activate_fn(win, box_height, box_width, items[selected])
             elif key == ord("c"):
-                self._clear_job_filters()
+                (clear_fn or self._clear_job_filters)()
             elif key in (ord("s"), ord("u"), ord("g"), ord("p")):
                 shortcut_actions = {
                     ord("s"): ("status",),
@@ -363,7 +436,25 @@ class JobFilterMenuMixin:
         self,
         choices: JobFilterChoices,
     ) -> list[dict[str, object]]:
-        selected_partitions = self._selected_job_partitions()
+        return self._partition_filter_items(
+            choices,
+            self._selected_job_partitions(),
+        )
+
+    def _priority_partition_filter_items(
+        self,
+        choices: JobFilterChoices,
+    ) -> list[dict[str, object]]:
+        return self._partition_filter_items(
+            choices,
+            self._selected_priority_partitions(),
+        )
+
+    def _partition_filter_items(
+        self,
+        choices: JobFilterChoices,
+        selected_partitions: set[str],
+    ) -> list[dict[str, object]]:
         items: list[dict[str, object]] = [
             {
                 "kind": "action",
@@ -503,20 +594,62 @@ class JobFilterMenuMixin:
         choices: JobFilterChoices,
         item: dict[str, object],
     ) -> None:
+        self._activate_partition_filter_item(
+            win,
+            box_height,
+            box_width,
+            choices,
+            item,
+            selected_fn=self._selected_job_partitions,
+            setter=self._set_job_partition_filters,
+            after_change=self._refresh_jobs_after_filter_change,
+        )
+
+    def _activate_priority_partition_filter_item(
+        self,
+        win: curses.window,
+        box_height: int,
+        box_width: int,
+        choices: JobFilterChoices,
+        item: dict[str, object],
+    ) -> None:
+        self._activate_partition_filter_item(
+            win,
+            box_height,
+            box_width,
+            choices,
+            item,
+            selected_fn=self._selected_priority_partitions,
+            setter=self._set_priority_partition_filters,
+            after_change=self._reset_priority_after_filter_change,
+        )
+
+    def _activate_partition_filter_item(
+        self,
+        win: curses.window,
+        box_height: int,
+        box_width: int,
+        choices: JobFilterChoices,
+        item: dict[str, object],
+        *,
+        selected_fn,
+        setter,
+        after_change,
+    ) -> None:
         kind = item["kind"]
         action = item.get("action")
         if kind == "partition":
-            partitions = self._selected_job_partitions()
+            partitions = selected_fn()
             value = str(item["value"])
             if value in partitions:
                 partitions.remove(value)
             else:
                 partitions.add(value)
-            self._set_job_partition_filters(partitions)
+            setter(partitions)
         elif action == "partitions_all":
-            self._set_job_partition_filters(set(choices.partitions))
+            setter(set(choices.partitions))
         elif action == "partitions_clear":
-            self._set_job_partition_filters(set())
+            setter(set())
         elif action == "custom_partition":
             value = self._read_jobs_filter_choice(
                 win,
@@ -529,8 +662,8 @@ class JobFilterMenuMixin:
                 if value not in choices.partitions:
                     choices.partitions.append(value)
                     choices.partitions.sort()
-                self._set_job_partition_filters({value})
-        self._refresh_jobs_after_filter_change()
+                setter({value})
+        after_change()
 
     def _read_jobs_filter_choice(
         self,

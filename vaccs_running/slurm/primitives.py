@@ -159,6 +159,94 @@ def parse_int(value: str) -> int:
         return 0
 
 
+def parse_optional_int(value: str) -> int | None:
+    """Parse an integer field without turning missing Slurm data into zero."""
+    stripped = value.strip()
+    if not stripped or stripped.upper() in {
+        "N/A",
+        "NA",
+        "NONE",
+        "UNKNOWN",
+        "(NULL)",
+    }:
+        return None
+    try:
+        return int(stripped)
+    except ValueError:
+        # Some Slurm versions/plugins render integral weighted factors with a
+        # decimal suffix. Accept only values which are still exactly integral.
+        try:
+            parsed = float(stripped)
+        except ValueError:
+            return None
+        if not parsed.is_integer():
+            return None
+        return int(parsed)
+
+
+def pending_reason_code(reason: str) -> str:
+    """The stable Slurm reason token, without display punctuation/details."""
+    stripped = reason.strip().strip("()")
+    if not stripped:
+        return "Unknown"
+    return stripped.split(",", 1)[0].split(maxsplit=1)[0]
+
+
+_PENDING_REASON_EXPLANATIONS = {
+    "Priority": "Higher-priority jobs are ahead in this partition or reservation.",
+    "Resources": "The requested resources are currently in use or unavailable.",
+    "Dependency": "A job dependency has not completed yet.",
+    "DependencyNeverSatisfied": "A dependency can no longer be satisfied.",
+    "BeginTime": "The job's requested earliest start time has not arrived yet.",
+    "JobHeldUser": "The job is held by its user or account coordinator.",
+    "JobHeldAdmin": "The job is held by a cluster administrator.",
+    "JobHoldMaxRequeue": "The job reached the cluster's maximum requeue count.",
+    "JobArrayTaskLimit": "The job array's simultaneous-task limit is currently full.",
+    "JobLaunchFailure": "Slurm could not launch the job on its assigned resources.",
+    "InactiveLimit": "The job exceeded the cluster's allowed inactive time.",
+    "InvalidAccount": "The requested Slurm account is not valid for this job.",
+    "InvalidQOS": "The requested quality of service is not valid for this job.",
+    "BadConstraints": "No available node can satisfy the requested constraints.",
+    "PartitionDown": "The requested partition is down.",
+    "PartitionInactive": "The requested partition is inactive.",
+    "PartitionNodeLimit": "The node request is outside the partition's limits.",
+    "PartitionTimeLimit": "The time request exceeds the partition's limit.",
+    "NodeDown": "A node required by the job is down.",
+    "ReqNodeNotAvail": "A specifically required node is unavailable.",
+    "Reservation": "The job is waiting for its reservation to become active.",
+    "ReservationDeleted": "The job's requested reservation was deleted.",
+    "Licenses": "A requested software license is unavailable.",
+    "Cleaning": "The job is being requeued while its previous run is cleaned up.",
+    "Prolog": "The job's cluster prolog is still running.",
+    "WaitingForScheduling": "The scheduler has not assigned a final reason yet.",
+    "SchedDefer": "The scheduler deferred evaluation of this job.",
+    "SystemFailure": "A cluster, network, or filesystem failure is blocking the job.",
+}
+
+
+def explain_pending_reason(reason: str) -> str:
+    """Plain-language explanation for common Slurm pending reason codes."""
+    code = pending_reason_code(reason)
+    explanation = _PENDING_REASON_EXPLANATIONS.get(code)
+    if explanation:
+        return explanation
+    if code.startswith("QOSGrp"):
+        return "The job's QOS has reached an aggregate usage limit."
+    if code.startswith("QOSMax"):
+        return "The request exceeds a per-job or per-node QOS limit."
+    if code.startswith("QOS"):
+        return "A quality-of-service policy or usage limit is blocking the job."
+    if code.startswith("AssocGrp"):
+        return "The Slurm account association has reached an aggregate limit."
+    if code.startswith("AssocMax"):
+        return "The request exceeds a Slurm account association limit."
+    if code.startswith("Max"):
+        return "The request exceeds an account or QOS resource limit."
+    if code == "Unknown":
+        return "Slurm has not reported why this job is pending."
+    return f"Slurm reports the pending reason {code}."
+
+
 def plural_label(count: int, singular: str) -> str:
     suffix = "" if count == 1 else "s"
     return f"{count} {singular}{suffix}"
@@ -173,9 +261,22 @@ def single_or_mixed_label(values: set[str]) -> str:
 
 
 def parse_gpu_count(value: str) -> int:
+    # ReqTRES can contain both a canonical total (``gres/gpu=2``) and a
+    # type-specific spelling (``gres/gpu:h200=2``). Prefer the canonical total
+    # so the same GPUs are not counted twice. GRES strings with only typed
+    # resources still need their types summed.
+    generic = re.findall(
+        r"(?:^|[,;])(?:gres/)?gpu[:=](\d+)(?=$|[,;])",
+        value,
+    )
+    if generic:
+        return sum(int(match) for match in generic)
     return sum(
         int(match)
-        for match in re.findall(r"(?:gres/)?gpu(?::[^,;:=()]+)*[:=](\d+)", value)
+        for match in re.findall(
+            r"(?:^|[,;])(?:gres/)?gpu(?::[^,;:=()]+)+[:=](\d+)",
+            value,
+        )
     )
 
 

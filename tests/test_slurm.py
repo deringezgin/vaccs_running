@@ -6,8 +6,10 @@ from vaccs_running.slurm import (
     FILTER_CHOICES_FORMAT,
     SACCT_FORMAT,
     NODE_JOBS_FORMAT,
+    PRIORITY_QUEUE_LONG_FORMAT,
     SQUEUE_FORMAT,
     SREPORT_USAGE_FORMAT,
+    SPRIO_FORMAT,
     SSHARE_FAIRSHARE_FORMAT,
     USAGE_TRES,
     USER_INFO_WINDOWS,
@@ -15,6 +17,7 @@ from vaccs_running.slurm import (
     GpfsQuota,
     JOB_EFFICIENCY_FORMAT,
     LeaderboardRow,
+    PriorityFactors,
     SlurmClient,
     SlurmError,
     UsageEntry,
@@ -30,6 +33,7 @@ from vaccs_running.slurm import (
     VACC_PARTITIONS,
     aggregate_user_usage,
     build_group_leaderboard,
+    build_priority_queue_snapshot,
     build_user_leaderboard,
     format_fairshare,
     format_node_jobs,
@@ -44,9 +48,13 @@ from vaccs_running.slurm import (
     parse_fairshare_value,
     parse_level_fairshare_value,
     parse_node_job_line,
+    parse_priority_queue_line,
+    parse_priority_queue_long_line,
+    parse_priority_tres,
     parse_scontrol_nodes,
     parse_scontrol_job_usage,
     parse_sreport_usage,
+    parse_sprio_line,
     parse_sshare_fairshare,
     parse_sshare_scores,
     parse_squeue_line,
@@ -55,6 +63,7 @@ from vaccs_running.slurm import (
     parse_memory_mb,
     parse_tres_value,
     normalize_squeue_states,
+    explain_pending_reason,
     sort_leaderboard,
     summarize_jobs,
     usage_window_start,
@@ -76,6 +85,705 @@ class FakeRunner:
         if self.outputs is not None:
             return self.outputs.pop(0) if self.outputs else ""
         return self.output
+
+
+def priority_queue_line(
+    job_id,
+    user,
+    partition,
+    reason,
+    priority,
+    name="job",
+    reservation="N/A",
+):
+    return (
+        f"{job_id}|{user}|{partition}|PENDING|{reason}|{priority}|pi-{user}|"
+        f"normal|2026-07-15T09:00:00|N/A|{reservation}|1|4|N/A|02:00:00|{name}"
+    )
+
+
+def priority_queue_long_line(
+    job_id,
+    user,
+    partition,
+    reason,
+    priority,
+    name="job",
+    *,
+    array_task="N/A",
+    requested_tres="cpu=4,mem=16G,node=1",
+    cpus="4",
+    limit="02:00:00",
+    reservation="N/A",
+):
+    return (
+        f"{job_id}|{array_task}|{user}|{partition}|PENDING|{reason}|{priority}|"
+        f"pi-{user}|normal|2026-07-15T09:00:00|N/A|{reservation}|1|{cpus}|"
+        f"{requested_tres}|{limit}|{name}|"
+    )
+
+
+class PriorityQueueTests(unittest.TestCase):
+    def test_priority_parsers_preserve_names_missing_factors_and_array_tres(self):
+        job = parse_priority_queue_line(
+            priority_queue_line("100_2", "me", "nvgpu", "Priority", "700", "a|b")
+        )
+        self.assertEqual(job.name, "a|b")
+        self.assertEqual(job.priority, 700)
+        self.assertEqual(job.reason_code, "Priority")
+        self.assertTrue(job.is_rankable)
+
+        factor_id, partition, factors = parse_sprio_line(
+            "100_[1-3]|me|pi-me|nvgpu|700||100||500"
+        )
+        self.assertEqual((factor_id, partition), ("100_[1-3]", "nvgpu"))
+        self.assertEqual(factors.age, 100)
+        self.assertEqual(factors.fairshare, 500)
+        self.assertIsNone(factors.site)
+        self.assertIsNone(factors.job_size)
+
+        self.assertEqual(
+            parse_priority_tres(
+                "100|2|cpu=4,mem=16G,node=1,gres/gpu=1|\n"
+                "200|N/A|cpu=1,mem=2G,node=1|\n"
+            ),
+            {
+                "100_2": "cpu=4,mem=16G,node=1,gres/gpu=1",
+                "200": "cpu=1,mem=2G,node=1",
+            },
+        )
+
+    def test_priority_long_parser_reconstructs_array_id_and_preserves_name_pipes(self):
+        job = parse_priority_queue_long_line(
+            priority_queue_long_line(
+                "100",
+                "me",
+                "nvgpu",
+                "Resources",
+                700,
+                "training|restart|3",
+                array_task="2",
+                requested_tres=(
+                    "cpu=8,mem=64G,node=1,gres/gpu=2,gres/gpu:h100=2"
+                ),
+                cpus="8",
+                limit="1-12:00:00",
+            )
+        )
+
+        self.assertEqual(job.job_id, "100_2")
+        self.assertEqual(job.array_parent, "100")
+        self.assertEqual(job.name, "training|restart|3")
+        self.assertEqual(job.requested_cpu_count, 8)
+        self.assertEqual(job.requested_memory_mb, 64 * 1024)
+        self.assertEqual(job.requested_gpu_count, 2)
+        self.assertEqual(job.requested_walltime_seconds, 36 * 60 * 60)
+
+    def test_snapshot_ranks_only_schedulable_jobs_in_same_partition(self):
+        jobs = [
+            parse_priority_queue_line(
+                priority_queue_line("500", "dave", "nvgpu", "JobHeldUser", 1200)
+            ),
+            parse_priority_queue_line(
+                priority_queue_line("200", "bob", "nvgpu", "Priority", 900)
+            ),
+            parse_priority_queue_line(
+                priority_queue_line("101", "me", "nvgpu", "Dependency", 850)
+            ),
+            parse_priority_queue_line(
+                priority_queue_line("300", "alice", "nvgpu", "Resources", 800)
+            ),
+            parse_priority_queue_line(
+                priority_queue_line("400", "carol", "general", "Priority", 950)
+            ),
+            parse_priority_queue_line(
+                priority_queue_line("100", "me", "nvgpu", "Priority", 700)
+            ),
+        ]
+        snapshot = build_priority_queue_snapshot(
+            "me",
+            jobs,
+            [("100", "nvgpu", PriorityFactors(priority=700, age=100, fairshare=500))],
+            factors_available=True,
+        )
+
+        ranked, held = snapshot.my_jobs
+        self.assertEqual(ranked.priority_rank_text, "3 of 3")
+        self.assertEqual(ranked.earlier_count, 2)
+        self.assertEqual(ranked.earlier_user_count, 2)
+        self.assertEqual(ranked.ahead, ())
+        self.assertEqual(ranked.job.factors.fairshare, 500)
+        self.assertIsNone(held.priority_rank)
+        self.assertIn("Dependency", held.rank_note)
+        self.assertEqual(len(snapshot.grouped_entries), 6)
+        self.assertEqual(
+            [entry.job.user for entry in snapshot.grouped_entries],
+            ["bob", "alice", "me", "dave", "me", "carol"],
+        )
+
+    def test_snapshot_compacts_array_tasks_into_partition_rank_bands(self):
+        jobs = [
+            parse_priority_queue_line(
+                priority_queue_line("900", "alice", "nvgpu", "Priority", 900)
+            ),
+            *[
+                parse_priority_queue_line(
+                    priority_queue_line(
+                        f"100_{task}", "me", "nvgpu", "Resources", 700
+                    )
+                )
+                for task in (2, 3, 4)
+            ],
+            *[
+                parse_priority_queue_line(
+                    priority_queue_line(
+                        f"100_{task}", "me", "gpu-preempt", "Resources", 600
+                    )
+                )
+                for task in (2, 3, 4)
+            ],
+        ]
+
+        snapshot = build_priority_queue_snapshot("me", jobs)
+
+        self.assertEqual(len(snapshot.pending_jobs), 7)
+        self.assertEqual(len(snapshot.all_entries), 7)
+        self.assertEqual(len(snapshot.grouped_entries), 3)
+        self.assertEqual(len(snapshot.my_jobs), 2)
+        nvgpu, preempt = snapshot.my_jobs
+        self.assertEqual(nvgpu.display_job_id, "100_[2-4]")
+        self.assertEqual(nvgpu.task_count, 3)
+        self.assertEqual(nvgpu.priority_rank_text, "2-4 of 4")
+        self.assertEqual(nvgpu.earlier_count, 1)
+        self.assertEqual(nvgpu.earlier_user_count, 1)
+        self.assertEqual(nvgpu.ahead, ())
+        self.assertEqual(preempt.priority_rank_text, "1-3 of 3")
+        self.assertEqual(snapshot.all_entries[1].earlier_count, 1)
+        self.assertEqual(snapshot.all_entries[2].earlier_count, 2)
+        self.assertEqual(snapshot.all_entries[2].earlier_user_count, 2)
+        self.assertEqual(snapshot.all_entries[2].ahead, ())
+        self.assertTrue(all(not entry.ahead for entry in snapshot.grouped_entries))
+
+    def test_snapshot_packs_every_users_arrays_but_keeps_raw_extended_rows(self):
+        jobs = [
+            *[
+                parse_priority_queue_line(
+                    priority_queue_line(
+                        f"900_{task}", "alice", "nvgpu", "Priority", 900
+                    )
+                )
+                for task in (1, 2)
+            ],
+            parse_priority_queue_line(
+                priority_queue_line("800", "bob", "nvgpu", "Priority", 800)
+            ),
+            *[
+                parse_priority_queue_line(
+                    priority_queue_line(
+                        f"700_{task}", "me", "nvgpu", "Resources", 700
+                    )
+                )
+                for task in (1, 2)
+            ],
+        ]
+
+        snapshot = build_priority_queue_snapshot("me", jobs)
+
+        self.assertEqual(len(snapshot.all_entries), 5)
+        self.assertEqual(len(snapshot.grouped_entries), 3)
+        alice, bob, mine = snapshot.grouped_entries
+        self.assertEqual(alice.display_job_id, "900_[1-2]")
+        self.assertEqual(alice.priority_rank_text, "1-2 of 5")
+        self.assertEqual((alice.earlier_count, alice.earlier_user_count), (0, 0))
+        self.assertEqual(bob.priority_rank_text, "3 of 5")
+        self.assertEqual((bob.earlier_count, bob.earlier_user_count), (2, 1))
+        self.assertEqual(mine.display_job_id, "700_[1-2]")
+        self.assertEqual(mine.priority_rank_text, "4-5 of 5")
+        self.assertEqual((mine.earlier_count, mine.earlier_user_count), (3, 2))
+        self.assertEqual(snapshot.my_jobs, (mine,))
+        self.assertTrue(all(not entry.ahead for entry in snapshot.grouped_entries))
+
+    def test_interleaved_tasks_from_one_array_do_not_create_overlapping_rank_runs(self):
+        snapshot = build_priority_queue_snapshot(
+            "me",
+            [
+                parse_priority_queue_line(
+                    priority_queue_line("100_1", "me", "nvgpu", "Priority", 900)
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line("200", "bob", "nvgpu", "Priority", 850)
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line("100_2", "me", "nvgpu", "Resources", 800)
+                ),
+            ],
+        )
+
+        self.assertEqual(len(snapshot.grouped_entries), 3)
+        first_task, bob, second_task = snapshot.grouped_entries
+        self.assertEqual(first_task.task_job_ids, ("100_1",))
+        self.assertEqual(first_task.priority_rank_text, "1 of 3")
+        self.assertEqual(bob.task_job_ids, ("200",))
+        self.assertEqual(bob.priority_rank_text, "2 of 3")
+        self.assertEqual(second_task.task_job_ids, ("100_2",))
+        self.assertEqual(second_task.priority_rank_text, "3 of 3")
+        self.assertEqual(
+            set(first_task.task_job_ids)
+            & set(bob.task_job_ids + second_task.task_job_ids),
+            set(),
+        )
+
+    def test_snapshot_splits_one_array_when_pending_reasons_differ(self):
+        snapshot = build_priority_queue_snapshot(
+            "me",
+            [
+                parse_priority_queue_line(
+                    priority_queue_line("100_1", "me", "nvgpu", "Priority", 700)
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line("100_2", "me", "nvgpu", "Dependency", 700)
+                ),
+            ],
+        )
+
+        self.assertEqual(len(snapshot.grouped_entries), 2)
+        ranked, dependency = snapshot.grouped_entries
+        self.assertEqual(ranked.task_job_ids, ("100_1",))
+        self.assertEqual(ranked.priority_rank_text, "1 of 1")
+        self.assertEqual(dependency.task_job_ids, ("100_2",))
+        self.assertIsNone(dependency.priority_rank)
+
+    def test_snapshot_packs_consecutive_ranked_jobs_from_the_same_user(self):
+        jobs = [
+            parse_priority_queue_line(
+                priority_queue_line("1000", "alice", "nvgpu", "Priority", 1000)
+            ),
+            *[
+                parse_priority_queue_line(
+                    priority_queue_line(
+                        str(900 + index),
+                        "fsabokro",
+                        "nvgpu",
+                        "Priority",
+                        900 - index,
+                        f"job-{index}",
+                    )
+                )
+                for index in range(10)
+            ],
+            parse_priority_queue_line(
+                priority_queue_line("800", "bob", "nvgpu", "Priority", 700)
+            ),
+        ]
+
+        snapshot = build_priority_queue_snapshot("me", jobs)
+
+        self.assertEqual(len(snapshot.all_entries), 12)
+        self.assertEqual(len(snapshot.grouped_entries), 3)
+        alice, fsabokro, bob = snapshot.grouped_entries
+        self.assertEqual(alice.job.user, "alice")
+        self.assertEqual(fsabokro.job.user, "fsabokro")
+        self.assertEqual(fsabokro.display_job_id, "10 jobs")
+        self.assertEqual(fsabokro.job_count, 10)
+        self.assertEqual(fsabokro.source_group_count, 10)
+        self.assertEqual(fsabokro.task_count, 10)
+        self.assertEqual(fsabokro.priority_rank_text, "2-11 of 12")
+        self.assertEqual(fsabokro.display_priority, "900-891")
+        self.assertEqual(fsabokro.display_name, "mixed jobs")
+        self.assertEqual((fsabokro.earlier_count, fsabokro.earlier_user_count), (1, 1))
+        self.assertIn("Press e", fsabokro.rank_note)
+        self.assertEqual(bob.job.user, "bob")
+        self.assertTrue(all(not entry.ahead for entry in snapshot.grouped_entries))
+
+    def test_same_user_jobs_separated_by_another_user_form_separate_runs(self):
+        jobs = [
+            *[
+                parse_priority_queue_line(
+                    priority_queue_line(
+                        str(900 + index), "fsabokro", "nvgpu", "Priority", 900 - index
+                    )
+                )
+                for index in range(3)
+            ],
+            parse_priority_queue_line(
+                priority_queue_line("800", "bob", "nvgpu", "Priority", 800)
+            ),
+            *[
+                parse_priority_queue_line(
+                    priority_queue_line(
+                        str(700 + index), "fsabokro", "nvgpu", "Resources", 700 - index
+                    )
+                )
+                for index in range(2)
+            ],
+        ]
+
+        snapshot = build_priority_queue_snapshot("me", jobs)
+
+        self.assertEqual(len(snapshot.grouped_entries), 3)
+        first_run, bob, second_run = snapshot.grouped_entries
+        self.assertEqual((first_run.job.user, first_run.job_count), ("fsabokro", 3))
+        self.assertEqual((bob.job.user, bob.job_count), ("bob", 1))
+        self.assertEqual((second_run.job.user, second_run.job_count), ("fsabokro", 2))
+        self.assertEqual(second_run.display_reason, "Resources")
+
+    def test_same_user_consecutive_partition_ranks_merge_despite_other_scope_rows(self):
+        snapshot = build_priority_queue_snapshot(
+            "me",
+            [
+                parse_priority_queue_line(
+                    priority_queue_line("900", "fsabokro", "nvgpu", "Priority", 900)
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line(
+                        "850", "alice", "gpu-preempt", "Priority", 850
+                    )
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line("800", "fsabokro", "nvgpu", "Resources", 800)
+                ),
+            ],
+        )
+
+        self.assertEqual(len(snapshot.grouped_entries), 2)
+        nvgpu_run, preempt = snapshot.grouped_entries
+        self.assertEqual(nvgpu_run.job_count, 2)
+        self.assertEqual(nvgpu_run.priority_rank_text, "1-2 of 2")
+        self.assertEqual(nvgpu_run.display_reason, "Priority/Resources")
+        self.assertEqual(preempt.job.partition, "gpu-preempt")
+
+    def test_same_user_jobs_do_not_merge_across_reservations(self):
+        snapshot = build_priority_queue_snapshot(
+            "me",
+            [
+                parse_priority_queue_line(
+                    priority_queue_line(
+                        "900", "fsabokro", "nvgpu", "Priority", 900, reservation="a"
+                    )
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line(
+                        "800", "fsabokro", "nvgpu", "Priority", 800, reservation="b"
+                    )
+                ),
+            ],
+        )
+
+        self.assertEqual(len(snapshot.grouped_entries), 2)
+        self.assertTrue(all(entry.job_count == 1 for entry in snapshot.grouped_entries))
+
+    def test_packed_runs_cover_exactly_one_through_n_in_each_rank_scope(self):
+        snapshot = build_priority_queue_snapshot(
+            "me",
+            [
+                parse_priority_queue_line(
+                    priority_queue_line("900", "alice", "nvgpu", "Priority", 900)
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line("850", "carol", "general", "Priority", 850)
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line("800", "alice", "nvgpu", "Resources", 800)
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line(
+                        "750", "me", "nvgpu", "Priority", 750, reservation="lab"
+                    )
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line("700", "bob", "nvgpu", "Priority", 700)
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line(
+                        "650", "me", "nvgpu", "Resources", 650, reservation="lab"
+                    )
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line("600", "dave", "general", "Resources", 600)
+                ),
+            ],
+        )
+
+        coverage = {}
+        totals = {}
+        for entry in snapshot.grouped_entries:
+            if entry.priority_rank is None:
+                continue
+            reservation = entry.job.reservation
+            if reservation.upper() in {"N/A", "NONE", "(NULL)"}:
+                reservation = ""
+            scope = (entry.job.partition, reservation)
+            coverage.setdefault(scope, []).extend(
+                range(entry.priority_rank, (entry.rank_end or entry.priority_rank) + 1)
+            )
+            totals.setdefault(scope, entry.rank_total)
+            self.assertEqual(totals[scope], entry.rank_total)
+
+        self.assertEqual(
+            coverage,
+            {
+                ("nvgpu", ""): [1, 2, 3],
+                ("general", ""): [1, 2],
+                ("nvgpu", "lab"): [1, 2],
+            },
+        )
+        for scope, ranks in coverage.items():
+            self.assertEqual(ranks, list(range(1, totals[scope] + 1)))
+
+    def test_unranked_holds_and_dependencies_follow_ranked_scope_rows(self):
+        snapshot = build_priority_queue_snapshot(
+            "me",
+            [
+                parse_priority_queue_line(
+                    priority_queue_line("400", "held", "nvgpu", "JobHeldUser", 999)
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line("300", "alice", "nvgpu", "Priority", 900)
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line("200", "blocked", "nvgpu", "Dependency", 850)
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line("100", "bob", "nvgpu", "Resources", 800)
+                ),
+            ],
+        )
+
+        self.assertEqual(
+            [entry.job.reason_code for entry in snapshot.all_entries],
+            ["Priority", "Resources", "JobHeldUser", "Dependency"],
+        )
+        self.assertEqual(
+            [entry.priority_rank for entry in snapshot.all_entries],
+            [1, 2, None, None],
+        )
+        self.assertEqual(
+            [entry.job.job_id for entry in snapshot.grouped_entries],
+            ["300", "100", "400", "200"],
+        )
+
+    def test_rank_run_sums_requested_resources_and_shows_walltime_range(self):
+        snapshot = build_priority_queue_snapshot(
+            "me",
+            [
+                parse_priority_queue_long_line(
+                    priority_queue_long_line(
+                        "200",
+                        "alice",
+                        "nvgpu",
+                        "Priority",
+                        900,
+                        requested_tres=(
+                            "cpu=4,mem=16G,node=1,gres/gpu=2,gres/gpu:h100=2"
+                        ),
+                        cpus="4",
+                        limit="02:00:00",
+                    )
+                ),
+                parse_priority_queue_long_line(
+                    priority_queue_long_line(
+                        "100",
+                        "alice",
+                        "nvgpu",
+                        "Resources",
+                        800,
+                        requested_tres="cpu=8,mem=32G,node=1,gres/gpu:a100=1",
+                        cpus="8",
+                        limit="04:00:00",
+                    )
+                ),
+            ],
+        )
+
+        self.assertEqual(len(snapshot.grouped_entries), 1)
+        run = snapshot.grouped_entries[0]
+        self.assertEqual(run.priority_rank_text, "1-2 of 2")
+        self.assertEqual(run.requested_gpus, 3)
+        self.assertEqual(run.requested_cpus, 12)
+        self.assertEqual(run.requested_memory_mb, 48 * 1024)
+        self.assertEqual(run.display_memory, "48G")
+        self.assertEqual(run.walltime_min_seconds, 2 * 60 * 60)
+        self.assertEqual(run.walltime_max_seconds, 4 * 60 * 60)
+        self.assertEqual(run.display_walltime, "2h–4h")
+
+    def test_rank_run_marks_incomplete_resource_and_walltime_totals_unknown(self):
+        snapshot = build_priority_queue_snapshot(
+            "me",
+            [
+                parse_priority_queue_long_line(
+                    priority_queue_long_line(
+                        "200",
+                        "alice",
+                        "nvgpu",
+                        "Priority",
+                        900,
+                        requested_tres="cpu=4,mem=16G,node=1,gres/gpu=1",
+                        cpus="4",
+                        limit="02:00:00",
+                    )
+                ),
+                parse_priority_queue_long_line(
+                    priority_queue_long_line(
+                        "100",
+                        "alice",
+                        "nvgpu",
+                        "Resources",
+                        800,
+                        requested_tres="",
+                        cpus="2",
+                        limit="N/A",
+                    )
+                ),
+            ],
+        )
+
+        run = snapshot.grouped_entries[0]
+        self.assertIsNone(run.requested_gpus)
+        self.assertEqual(run.requested_cpus, 6)
+        self.assertIsNone(run.requested_memory_mb)
+        self.assertIsNone(run.walltime_min_seconds)
+        self.assertIsNone(run.walltime_max_seconds)
+        self.assertEqual(run.display_gpus, "-")
+        self.assertEqual(run.display_cpus, "6")
+        self.assertEqual(run.display_memory, "-")
+        self.assertEqual(run.display_walltime, "-")
+
+    def test_gpu_parser_prefers_generic_total_over_type_breakdown(self):
+        self.assertEqual(
+            parse_gpu_count("gres/gpu=2,gres/gpu:h100=2"),
+            2,
+        )
+        self.assertEqual(
+            parse_gpu_count("gres/gpu:a100=1,gres/gpu:h100=2"),
+            3,
+        )
+
+    def test_client_uses_scheduler_order_user_sprio_and_cached_factors(self):
+        queue = "\n".join(
+            [
+                priority_queue_long_line(
+                    "200", "bob", "nvgpu", "Priority", 900
+                ),
+                priority_queue_long_line(
+                    "100",
+                    "me",
+                    "nvgpu",
+                    "Resources",
+                    700,
+                    array_task="2",
+                    requested_tres="cpu=4,mem=16G,node=1,billing=4,gres/gpu=1",
+                ),
+            ]
+        )
+        sprio = "100_[1-3]|me|pi-me|nvgpu|700|0|100|0|500|10|0|0|gpu=80|0\n"
+        client = SlurmClient(user="me")
+        fake_runner = FakeRunner([queue, sprio, queue])
+        client.runner = fake_runner
+
+        first = client.fetch_priority_queue()
+        first_queue_calls = [
+            call
+            for call in fake_runner.calls
+            if call[0][0] == "squeue" and "-O" in call[0]
+        ]
+        self.assertEqual(len(first_queue_calls), 1)
+        second = client.fetch_priority_queue()
+
+        self.assertEqual(first.my_jobs[0].priority_rank_text, "2 of 2")
+        self.assertEqual(first.my_jobs[0].job.gpu_count, 1)
+        self.assertEqual(first.my_jobs[0].requested_gpus, 1)
+        self.assertEqual(first.my_jobs[0].requested_cpus, 4)
+        self.assertEqual(first.my_jobs[0].requested_memory_mb, 16 * 1024)
+        self.assertEqual(first.my_jobs[0].job.factors.age, 100)
+        self.assertTrue(first.factors_available)
+        self.assertEqual(second.my_jobs[0].job.factors.fairshare, 500)
+        self.assertEqual(
+            fake_runner.calls[0][0],
+            [
+                "squeue",
+                "--array",
+                "--all",
+                "-h",
+                "-t",
+                "PD",
+                "--priority",
+                "--sort=-p,i",
+                "-O",
+                PRIORITY_QUEUE_LONG_FORMAT,
+            ],
+        )
+        sprio_calls = [call for call in fake_runner.calls if call[0][0] == "sprio"]
+        queue_calls = [
+            call
+            for call in fake_runner.calls
+            if call[0][0] == "squeue" and "-O" in call[0]
+        ]
+        self.assertEqual(len(sprio_calls), 1)
+        self.assertEqual(len(queue_calls), 2)
+        self.assertTrue(all("-u" not in call[0] for call in queue_calls))
+        self.assertEqual(
+            sprio_calls[0][0],
+            ["sprio", "-h", "-u", "me", "-o", SPRIO_FORMAT],
+        )
+
+    def test_client_without_current_user_still_reports_other_users_resources(self):
+        queue = priority_queue_long_line(
+            "200",
+            "bob",
+            "nvgpu",
+            "Priority",
+            900,
+            requested_tres=(
+                "cpu=12,mem=96G,node=1,gres/gpu=2,gres/gpu:h100=2"
+            ),
+            cpus="12",
+            limit="1-00:00:00",
+        )
+        client = SlurmClient(user="me")
+        fake_runner = FakeRunner(queue)
+        client.runner = fake_runner
+
+        snapshot = client.fetch_priority_queue()
+
+        self.assertEqual(snapshot.my_jobs, ())
+        self.assertEqual(len(snapshot.grouped_entries), 1)
+        entry = snapshot.grouped_entries[0]
+        self.assertEqual(entry.job.user, "bob")
+        self.assertEqual(entry.requested_gpus, 2)
+        self.assertEqual(entry.requested_cpus, 12)
+        self.assertEqual(entry.requested_memory_mb, 96 * 1024)
+        self.assertEqual(entry.walltime_min_seconds, 24 * 60 * 60)
+        self.assertEqual(len(fake_runner.calls), 1)
+        self.assertEqual(fake_runner.calls[0][0][0], "squeue")
+        self.assertIn("-O", fake_runner.calls[0][0])
+        self.assertNotIn("-u", fake_runner.calls[0][0])
+
+    def test_sprio_failure_keeps_queue_rank_and_reason(self):
+        class FailingSprioRunner(FakeRunner):
+            def run(self, args, timeout=12.0):
+                self.calls.append((args, timeout))
+                if args[0] == "sprio":
+                    raise SlurmError("priority/basic does not support sprio")
+                return priority_queue_long_line(
+                    "100", "me", "general", "Priority", 20
+                )
+
+        client = SlurmClient(user="me")
+        client.runner = FailingSprioRunner()
+        snapshot = client.fetch_priority_queue()
+
+        self.assertFalse(snapshot.factors_available)
+        self.assertIn("does not support sprio", snapshot.factors_error)
+        self.assertEqual(snapshot.my_jobs[0].priority_rank_text, "1 of 1")
+        self.assertEqual(
+            snapshot.my_jobs[0].job.reason_explanation,
+            "Higher-priority jobs are ahead in this partition or reservation.",
+        )
+
+    def test_reason_explanations_cover_holds_and_policy_families(self):
+        self.assertIn("held by its user", explain_pending_reason("(JobHeldUser)"))
+        self.assertIn("aggregate usage limit", explain_pending_reason("QOSGrpCpuLimit"))
+        self.assertIn("association", explain_pending_reason("AssocGrpMemLimit"))
 
 
 class SlurmParsingTests(unittest.TestCase):

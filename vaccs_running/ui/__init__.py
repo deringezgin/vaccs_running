@@ -3,7 +3,7 @@ from __future__ import annotations
 import curses
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # --- re-exported leaf helper modules (facade) ---
 from .constants import *  # noqa: F401,F403
@@ -19,6 +19,7 @@ from .popups import PopupMixin, command_text  # noqa: F401 (re-export)
 from .render_frame import RenderFrameMixin
 from .render_tables import RenderTablesMixin
 from .render_detail import RenderDetailMixin
+from .render_priority import RenderPriorityMixin
 from .render_leaderboard import RenderLeaderboardMixin
 from .leaderboard_data import LeaderboardDataMixin
 from .info_data import InfoDataMixin
@@ -33,6 +34,7 @@ from ..slurm import (
     Job,
     JobRecord,
     Node,
+    PriorityQueueSnapshot,
     SlurmClient,
 )
 
@@ -52,6 +54,7 @@ class AppState:
     job_records: list[JobRecord]
     nodes: list[Node]
     history: list[JobRecord]
+    priority_queue: PriorityQueueSnapshot | None = None
     view: str = "jobs"
     selected: int = 0
     scroll: int = 0
@@ -68,6 +71,8 @@ class AppState:
     leaderboard_filter: str = ""
     leaderboard_filter_editing: bool = False
     info_scroll: int = 0
+    priority_extended: bool = False
+    priority_partitions: set[str] = field(default_factory=set)
 
 
 class VaccsRunningApp(
@@ -77,6 +82,7 @@ class VaccsRunningApp(
     RenderFrameMixin,
     RenderTablesMixin,
     RenderDetailMixin,
+    RenderPriorityMixin,
     RenderLeaderboardMixin,
     LeaderboardDataMixin,
     InfoDataMixin,
@@ -102,7 +108,8 @@ class VaccsRunningApp(
             history=[],
             view=(
                 initial_view
-                if initial_view in {"jobs", "history", "nodes", "leaderboard", "info"}
+                if initial_view
+                in {"jobs", "history", "nodes", "leaderboard", "info", "priority"}
                 else "jobs"
             ),
         )
@@ -149,6 +156,10 @@ class VaccsRunningApp(
             and len(self.state.jobs) > BUSY_JOBS_REFRESH_THRESHOLD
         ):
             return max(self.refresh_seconds, BUSY_JOBS_REFRESH_SECONDS)
+        if self.state.view == "priority":
+            # sprio is a scheduler RPC; Slurm asks clients not to poll it in a
+            # tight loop. The view still loads immediately when opened.
+            return max(self.refresh_seconds, PRIORITY_REFRESH_SECONDS)
         return self.refresh_seconds
 
     def _main(self, stdscr: curses.window) -> None:
@@ -156,6 +167,7 @@ class VaccsRunningApp(
         stdscr.nodelay(True)
         stdscr.keypad(True)
         self._init_colors()
+        safe_mousemask()
         self._refresh_current()
 
         while True:

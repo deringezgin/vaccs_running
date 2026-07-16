@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+import re
 from typing import Iterable
 
 from .constants import (
@@ -35,10 +37,344 @@ from .models import (
     JobRecordGroup,
     LeaderboardRow,
     Node,
+    PriorityFactors,
+    PriorityQueueEntry,
+    PriorityQueueJob,
+    PriorityQueueSnapshot,
     UsageEntry,
     UserUsage,
 )
 from .parsers import record_from_job
+
+
+def _array_pattern_matches(pattern: str, job_id: str) -> bool:
+    """Whether a possibly-compressed sprio array ID names ``job_id``."""
+    if pattern == job_id:
+        return True
+    pattern_parent, separator, pattern_task = pattern.partition("_")
+    job_parent, job_separator, job_task = job_id.partition("_")
+    if pattern_parent != job_parent:
+        return False
+    if not separator:
+        # Some sprio versions report one factor row for the array parent.
+        return True
+    if not job_separator or not job_task.isdigit():
+        return False
+    if not (pattern_task.startswith("[") and "]" in pattern_task):
+        return False
+
+    task = int(job_task)
+    specification = pattern_task[1 : pattern_task.index("]")]
+    # Ignore an array concurrency throttle such as ``[1-20%4]``.
+    specification = specification.split("%", 1)[0]
+    for token in specification.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        match = re.fullmatch(r"(\d+)(?:-(\d+)(?::(\d+))?)?", token)
+        if not match:
+            continue
+        start = int(match.group(1))
+        end = int(match.group(2) or start)
+        step = max(1, int(match.group(3) or 1))
+        if start <= task <= end and (task - start) % step == 0:
+            return True
+    return False
+
+
+def attach_priority_factors(
+    jobs: Iterable[PriorityQueueJob],
+    factor_records: Iterable[tuple[str, str, PriorityFactors]],
+) -> list[PriorityQueueJob]:
+    """Merge best-effort sprio factors into scheduler-order queue rows."""
+    records = list(factor_records)
+    with_factors: list[PriorityQueueJob] = []
+    for job in jobs:
+        factor: PriorityFactors | None = None
+        # Prefer the exact job/partition row. A fallback handles compressed
+        # array IDs and sprio versions which leave the partition column blank.
+        for factor_id, partition, candidate in records:
+            if factor_id == job.job_id and partition == job.partition:
+                factor = candidate
+                break
+        if factor is None:
+            for factor_id, partition, candidate in records:
+                if partition and partition != job.partition:
+                    continue
+                if _array_pattern_matches(factor_id, job.job_id):
+                    factor = candidate
+                    break
+        if factor is None:
+            with_factors.append(job)
+            continue
+        with_factors.append(
+            replace(
+                job,
+                priority=job.priority if job.priority is not None else factor.priority,
+                factors=factor,
+            )
+        )
+    return with_factors
+
+
+def attach_priority_tres(
+    jobs: Iterable[PriorityQueueJob],
+    requested_tres: dict[str, str],
+) -> list[PriorityQueueJob]:
+    """Attach requested TRES from a separate long-format squeue query."""
+    return [
+        replace(job, requested_tres=requested_tres.get(job.job_id, ""))
+        if job.job_id in requested_tres
+        else job
+        for job in jobs
+    ]
+
+
+def _normalize_reservation(reservation: str) -> str:
+    if reservation.upper() in {"", "N/A", "NONE", "(NULL)"}:
+        return ""
+    return reservation
+
+
+def _priority_scope(job: PriorityQueueJob) -> tuple[str, str]:
+    return job.partition, _normalize_reservation(job.reservation)
+
+
+def _complete_sum(
+    entries: list[PriorityQueueEntry],
+    attribute: str,
+) -> int | None:
+    values = [getattr(entry, attribute) for entry in entries]
+    if any(value is None for value in values):
+        return None
+    return sum(values)
+
+
+def _merge_priority_slot_run(
+    entries: list[PriorityQueueEntry],
+) -> PriorityQueueEntry:
+    """Combine adjacent raw rank slots owned by one user into one row."""
+    first = entries[0]
+    if len(entries) == 1:
+        return first
+
+    task_job_ids = tuple(
+        job_id
+        for entry in entries
+        for job_id in (entry.task_job_ids or (entry.job.job_id,))
+    )
+    group_job_ids = tuple(
+        dict.fromkeys(
+            job_id
+            for entry in entries
+            for job_id in (entry.group_job_ids or (entry.job.array_parent,))
+        )
+    )
+    group_names = tuple(
+        dict.fromkeys(
+            name
+            for entry in entries
+            for name in (entry.group_names or (entry.job.name,))
+        )
+    )
+    group_priorities = tuple(
+        dict.fromkeys(
+            priority
+            for entry in entries
+            for priority in (
+                entry.group_priorities
+                or (() if entry.job.priority is None else (entry.job.priority,))
+            )
+        )
+    )
+    group_reason_codes = tuple(
+        dict.fromkeys(
+            reason
+            for entry in entries
+            for reason in (
+                entry.group_reason_codes
+                or (entry.job.reason_code or "Unknown",)
+            )
+        )
+    )
+    last = entries[-1]
+    rank_end = last.rank_end or last.priority_rank
+    task_count = sum(entry.task_count for entry in entries)
+    job_count = len(group_job_ids)
+    source_group_count = sum(entry.source_group_count for entry in entries)
+    scope = f"partition {first.job.partition}"
+    reservation = _normalize_reservation(first.job.reservation)
+    if reservation:
+        scope += f", reservation {reservation}"
+    walltimes = [entry.walltime_min_seconds for entry in entries]
+    complete_walltimes = all(value is not None for value in walltimes)
+    return replace(
+        first,
+        rank_end=rank_end,
+        task_count=task_count,
+        task_job_ids=task_job_ids,
+        group_job_ids=group_job_ids,
+        group_names=group_names,
+        group_priorities=group_priorities,
+        group_reason_codes=group_reason_codes,
+        source_group_count=source_group_count,
+        requested_gpus=_complete_sum(entries, "requested_gpus"),
+        requested_cpus=_complete_sum(entries, "requested_cpus"),
+        requested_memory_mb=_complete_sum(entries, "requested_memory_mb"),
+        walltime_min_seconds=(min(walltimes) if complete_walltimes else None),
+        walltime_max_seconds=(max(walltimes) if complete_walltimes else None),
+        rank_note=(
+            f"Priority-rank snapshot among schedulable pending jobs in {scope}; "
+            f"this row covers literal rank slots {first.priority_rank}-{rank_end}, "
+            f"all owned by {first.job.user}, across {job_count} job"
+            f"{'s' if job_count != 1 else ''}. "
+            "Press e to inspect them individually; resource fit, reservations, "
+            "preemption, and backfill can change actual start order."
+        ),
+    )
+
+
+def _pack_priority_rank_runs(
+    entries: list[PriorityQueueEntry],
+) -> list[PriorityQueueEntry]:
+    """Pack one already-ranked scope without losing or overlapping a slot."""
+    packed: list[PriorityQueueEntry] = []
+    run: list[PriorityQueueEntry] = []
+    for entry in entries:
+        previous_rank = run[-1].priority_rank if run else None
+        if (
+            run
+            and entry.job.user
+            and run[-1].job.user == entry.job.user
+            and previous_rank is not None
+            and entry.priority_rank == previous_rank + 1
+        ):
+            run.append(entry)
+            continue
+        if run:
+            packed.append(_merge_priority_slot_run(run))
+        run = [entry]
+    if run:
+        packed.append(_merge_priority_slot_run(run))
+    return packed
+
+
+def build_priority_queue_snapshot(
+    user: str,
+    jobs: Iterable[PriorityQueueJob],
+    factor_records: Iterable[tuple[str, str, PriorityFactors]] = (),
+    *,
+    factors_available: bool = False,
+    factors_error: str = "",
+) -> PriorityQueueSnapshot:
+    """Build cluster-wide packed/raw ranks from scheduler-ordered pending rows.
+
+    Ranks deliberately include only ``Priority`` and ``Resources`` rows in the
+    same partition/reservation. Holds, dependencies, invalid requests, and
+    policy limits can carry a high composite score (especially with
+    ``ACCRUE_ALWAYS``) but are not blockers in the normal schedulable queue.
+    """
+    pending_jobs = tuple(attach_priority_factors(jobs, factor_records))
+    jobs_by_scope: dict[tuple[str, str], list[PriorityQueueJob]] = {}
+    for job in pending_jobs:
+        jobs_by_scope.setdefault(_priority_scope(job), []).append(job)
+
+    rankable_by_scope = {
+        scope: [job for job in scoped_jobs if job.is_rankable]
+        for scope, scoped_jobs in jobs_by_scope.items()
+    }
+
+    # Build lightweight entries for the extended all-users view. Counts are
+    # accumulated once per partition/reservation; unlike the packed current-user
+    # rows, these do not copy every preceding job into every row.
+    all_entries_by_job: dict[int, PriorityQueueEntry] = {}
+    for (partition, reservation), ranked in rankable_by_scope.items():
+        earlier_users: set[str] = set()
+        scope = f"partition {partition}"
+        if reservation:
+            scope += f", reservation {reservation}"
+        for index, job in enumerate(ranked):
+            all_entries_by_job[id(job)] = PriorityQueueEntry(
+                job=job,
+                priority_rank=index + 1,
+                rank_total=len(ranked),
+                task_job_ids=(job.job_id,),
+                group_job_ids=(job.array_parent,),
+                group_names=(job.name,),
+                group_priorities=(job.priority,) if job.priority is not None else (),
+                group_reason_codes=(job.reason_code or "Unknown",),
+                ahead_count=index,
+                ahead_user_count=len(earlier_users),
+                requested_gpus=job.requested_gpu_count,
+                requested_cpus=job.requested_cpu_count,
+                requested_memory_mb=job.requested_memory_mb,
+                walltime_min_seconds=job.requested_walltime_seconds,
+                walltime_max_seconds=job.requested_walltime_seconds,
+                rank_note=(
+                    f"Priority-rank snapshot among schedulable pending jobs in {scope}; "
+                    "resource fit, reservations, preemption, and backfill can change "
+                    "actual start order."
+                ),
+            )
+            if job.user:
+                earlier_users.add(job.user)
+
+    unranked_entries_by_job: dict[int, PriorityQueueEntry] = {}
+    for job in pending_jobs:
+        if id(job) not in all_entries_by_job:
+            unranked_entries_by_job[id(job)] = PriorityQueueEntry(
+                job=job,
+                priority_rank=None,
+                rank_total=None,
+                task_job_ids=(job.job_id,),
+                group_job_ids=(job.array_parent,),
+                group_names=(job.name,),
+                group_priorities=(job.priority,) if job.priority is not None else (),
+                group_reason_codes=(job.reason_code or "Unknown",),
+                ahead_count=0,
+                ahead_user_count=0,
+                requested_gpus=job.requested_gpu_count,
+                requested_cpus=job.requested_cpu_count,
+                requested_memory_mb=job.requested_memory_mb,
+                walltime_min_seconds=job.requested_walltime_seconds,
+                walltime_max_seconds=job.requested_walltime_seconds,
+                rank_note=(
+                    f"No priority rank while Slurm reports {job.reason_code}; "
+                    "this job is not in the normal Priority/Resources queue."
+                ),
+            )
+
+    # Canonical queue order is a block per partition/reservation, in first-seen
+    # scope order. Ranked rows always cover 1..N exactly; unranked holds and
+    # dependencies remain visible after that scope's literal priority queue.
+    all_entries: list[PriorityQueueEntry] = []
+    grouped_entries: list[PriorityQueueEntry] = []
+    for scope, scoped_jobs in jobs_by_scope.items():
+        ranked_entries = [
+            all_entries_by_job[id(job)] for job in scoped_jobs if job.is_rankable
+        ]
+        unranked_entries = [
+            unranked_entries_by_job[id(job)]
+            for job in scoped_jobs
+            if not job.is_rankable
+        ]
+        all_entries.extend(ranked_entries)
+        all_entries.extend(unranked_entries)
+        grouped_entries.extend(_pack_priority_rank_runs(ranked_entries))
+        grouped_entries.extend(unranked_entries)
+
+    my_jobs = tuple(
+        entry for entry in grouped_entries if entry.job.user == user
+    )
+    return PriorityQueueSnapshot(
+        user=user,
+        pending_jobs=pending_jobs,
+        my_jobs=my_jobs,
+        grouped_entries=tuple(grouped_entries),
+        all_entries=tuple(all_entries),
+        factors_available=factors_available,
+        factors_error=factors_error,
+    )
 
 
 def format_job_efficiency(

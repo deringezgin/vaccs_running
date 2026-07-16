@@ -35,6 +35,88 @@ SQUEUE_FIELDS = [
 SQUEUE_FORMAT = "%i|%j|%T|%P|%N|%R|%M|%l|%D|%C|%b|%V|%S|%u|%g"
 
 
+PRIORITY_QUEUE_FIELDS = [
+    "job_id",
+    "user",
+    "partition",
+    "state",
+    "reason",
+    "priority",
+    "account",
+    "qos",
+    "submit_time",
+    "start_time",
+    "reservation",
+    "node_count",
+    "cpus",
+    "gres",
+    "limit",
+    # Keep the user-controlled job name last so an embedded ``|`` can be
+    # preserved by joining surplus fields in the parser.
+    "name",
+]
+
+
+PRIORITY_QUEUE_FORMAT = (
+    "%i|%u|%P|%T|%r|%Q|%a|%q|%V|%S|%v|%D|%C|%b|%l|%j"
+)
+
+
+# Long squeue fields let pending ``tres-alloc`` expose ReqTRES on VACC. The
+# ArrayTaskID column is kept separate because long JobID reports the array
+# parent, unlike the short %i field above.
+PRIORITY_QUEUE_LONG_FIELDS = [
+    "job_id",
+    "array_task_id",
+    "user",
+    "partition",
+    "state",
+    "reason",
+    "priority",
+    "account",
+    "qos",
+    "submit_time",
+    "start_time",
+    "reservation",
+    "node_count",
+    "cpus",
+    "requested_tres",
+    "limit",
+    "name",
+]
+
+
+PRIORITY_QUEUE_LONG_FORMAT = (
+    "JobID:|,ArrayTaskID:|,UserName:|,Partition:|,State:|,Reason:|,"
+    "PriorityLong:|,Account:|,QOS:|,SubmitTime:|,StartTime:|,Reservation:|,"
+    "NumNodes:|,NumCPUs:|,tres-alloc:|,TimeLimit:|,Name:|"
+)
+
+
+SPRIO_FIELDS = [
+    "job_id",
+    "user",
+    "account",
+    "partition",
+    "priority",
+    "site",
+    "age",
+    "association",
+    "fairshare",
+    "job_size",
+    "partition_factor",
+    "qos_factor",
+    "tres",
+    "nice",
+]
+
+
+# Uppercase sprio format codes are the weighted contributions which sum (with
+# the nice adjustment) to the composite priority. They are more useful in an
+# explanatory UI than the normalized 0..1 factors.
+SPRIO_FORMAT = "%i|%u|%o|%r|%Y|%S|%A|%B|%F|%J|%P|%Q|%T|%N"
+
+
 FILTER_CHOICES_FORMAT = "%u|%g|%P"
 
 
@@ -189,3 +271,10 @@ FAILED_STATES = {
     "PREEMPTED",
     "TIMEOUT",
 }
+
+
+# These two reasons mean the job has reached normal scheduler consideration;
+# other pending reasons may represent holds, dependencies, invalid requests,
+# limits, or resource-specific queues for which a simple numeric rank would be
+# misleading.
+PRIORITY_RANKABLE_REASONS = {"Priority", "Resources"}

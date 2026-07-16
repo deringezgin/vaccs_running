@@ -14,6 +14,7 @@ from .constants import (
     MUTED_PAIR,
     SPINNER_FRAMES,
     TITLE_PAIR,
+    TOP_TABS,
     USER_INFO_BOLD_STYLES,
     USER_INFO_STYLE_PAIRS,
 )
@@ -45,6 +46,8 @@ class RenderFrameMixin:
         self._draw_header(stdscr, width)
         if self.state.view == "info":
             self._draw_info(stdscr, height, width)
+        elif self.state.view == "priority":
+            self._draw_priority(stdscr, height, width)
         elif self.state.view == "nodes":
             self._draw_nodes_table(stdscr, self._visible_nodes(), height, width)
             self._draw_node_detail(stdscr, height, width)
@@ -98,13 +101,8 @@ class RenderFrameMixin:
         self._draw_box(stdscr, 0, 0, 3, width)
 
         x = 2
-        for view, label in [
-            ("jobs", " j Jobs "),
-            ("nodes", " n Nodes "),
-            ("history", " h History "),
-            ("leaderboard", " u Usage "),
-            ("info", " i Info "),
-        ]:
+        for view, key, name in TOP_TABS:
+            label = f" {key} {name} "
             attr = (
                 self._pair(ACTIVE_TAB_PAIR) | curses.A_BOLD
                 if self.state.view == view
@@ -123,7 +121,9 @@ class RenderFrameMixin:
                 title,
                 self._pair(TITLE_PAIR) | curses.A_BOLD,
             )
-        if width > len(right) + 2:
+        # Six tabs fit at the supported 70-column minimum, but the optional
+        # clock does not. Never let it overwrite the final tab.
+        if width > len(right) + 2 and x < right_x:
             self._addstr(stdscr, 1, right_x, right, self._pair(MUTED_PAIR))
         if self.state.view == "nodes":
             x = 1
@@ -207,6 +207,55 @@ class RenderFrameMixin:
             refresh_text = " r refresh "
             self._addstr(stdscr, 3, x, refresh_text, self._pair(MUTED_PAIR))
             x += len(refresh_text) + 1
+        elif self.state.view == "priority":
+            x = 1
+            extend_text = " e extend "
+            self._addstr(
+                stdscr,
+                3,
+                x,
+                extend_text,
+                self._pair(
+                    ACTIVE_TAB_PAIR if self.state.priority_extended else MUTED_PAIR
+                ),
+            )
+            x += len(extend_text) + 1
+            filter_text = " f filter "
+            self._addstr(
+                stdscr,
+                3,
+                x,
+                filter_text,
+                self._pair(
+                    ACTIVE_TAB_PAIR
+                    if self._priority_partition_filter_active()
+                    else MUTED_PAIR
+                ),
+            )
+            x += len(filter_text) + 1
+            gpu_text = " g gpu-queue "
+            self._addstr(
+                stdscr,
+                3,
+                x,
+                gpu_text,
+                self._pair(
+                    ACTIVE_TAB_PAIR
+                    if self._priority_gpu_filter_active()
+                    else MUTED_PAIR
+                ),
+            )
+            x += len(gpu_text) + 1
+            if self._priority_partition_filter_active():
+                partition_text = f" partition: {self._priority_partition_summary()} "
+                self._addstr(
+                    stdscr,
+                    3,
+                    x,
+                    partition_text,
+                    self._pair(ACTIVE_TAB_PAIR),
+                )
+                x += len(partition_text) + 1
         else:
             x = 1
             group_text = " g group "

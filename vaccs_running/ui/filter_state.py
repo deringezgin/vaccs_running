@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .constants import JOB_STATE_CODES
+from .constants import JOB_STATE_CODES, PRIORITY_GPU_PARTITIONS
 from ..slurm import plural_label
 
 
@@ -130,3 +130,41 @@ class JobFilterStateMixin:
         if len(partitions) == 1:
             return next(iter(partitions))
         return plural_label(len(partitions), "partition")
+
+    def _priority_partition_filter_active(self) -> bool:
+        return bool(self.state.priority_partitions)
+
+    def _selected_priority_partitions(self) -> set[str]:
+        return set(self.state.priority_partitions)
+
+    def _set_priority_partition_filters(self, partitions: set[str]) -> None:
+        self.state.priority_partitions = set(partitions)
+
+    def _priority_gpu_filter_active(self) -> bool:
+        return self._selected_priority_partitions() == set(PRIORITY_GPU_PARTITIONS)
+
+    def _toggle_priority_gpu_filter(self) -> None:
+        enabled = not self._priority_gpu_filter_active()
+        self._set_priority_partition_filters(
+            set(PRIORITY_GPU_PARTITIONS) if enabled else set()
+        )
+        self._reset_priority_after_filter_change()
+        state = "on" if enabled else "off"
+        self.state.message = f"GPU partition filter {state}"
+
+    def _priority_partition_summary(self) -> str:
+        partitions = self._selected_priority_partitions()
+        if not partitions:
+            return "all"
+        if len(partitions) == 1:
+            return next(iter(partitions))
+        return plural_label(len(partitions), "partition")
+
+    def _clear_priority_filters(self) -> None:
+        self._set_priority_partition_filters(set())
+        self._reset_priority_after_filter_change()
+
+    def _reset_priority_after_filter_change(self) -> None:
+        self.state.selected = 0
+        self.state.scroll = 0
+        self._clamp_selection()

@@ -10,7 +10,12 @@ from vaccs_running.slurm import (
     JobRecord,
     LEADERBOARD_WINDOWS,
     Node,
+    PriorityFactors,
+    PriorityQueueJob,
+    PriorityQueueSnapshot,
+    SlurmError,
     UsageEntry,
+    build_priority_queue_snapshot,
 )
 from vaccs_running.ui import (
     BUSY_JOBS_REFRESH_SECONDS,
@@ -19,6 +24,8 @@ from vaccs_running.ui import (
     LEADERBOARD_MIN_HEIGHT,
     LEADERBOARD_MIN_WIDTH,
     LEADERBOARD_PAGE,
+    PRIORITY_GPU_PARTITIONS,
+    PRIORITY_REFRESH_SECONDS,
     VaccsRunningApp,
     build_user_info_lines,
     command_text,
@@ -52,6 +59,14 @@ class FakeClient:
 
     def fetch_job_history(self, window):
         return []
+
+    def fetch_priority_queue(self):
+        return PriorityQueueSnapshot(
+            user=self.user,
+            pending_jobs=(),
+            my_jobs=(),
+            factors_available=True,
+        )
 
     def node_jobs(self, node_name):
         return f"jobs for {node_name}"
@@ -356,6 +371,50 @@ def make_job(
     )
 
 
+def make_priority_job(
+    job_id,
+    *,
+    user="tester",
+    name="pending-job",
+    partition="nvgpu",
+    reason="Priority",
+    priority=100,
+    account="pi-test",
+    requested_tres="cpu=4,mem=16G,node=1,gres/gpu=1",
+    limit="1-00:00:00",
+    reservation="",
+    factors=None,
+):
+    return PriorityQueueJob(
+        job_id=job_id,
+        user=user,
+        name=name,
+        partition=partition,
+        state="PENDING",
+        reason=reason,
+        priority=priority,
+        account=account,
+        qos="normal",
+        submit_time="2026-07-15T08:00:00",
+        start_time="N/A",
+        reservation=reservation,
+        node_count="1",
+        cpus="4",
+        gres="N/A",
+        requested_tres=requested_tres,
+        limit=limit,
+        factors=factors,
+    )
+
+
+def make_priority_snapshot(*jobs, user="tester", factors_available=True):
+    return build_priority_queue_snapshot(
+        user,
+        jobs,
+        factors_available=factors_available,
+    )
+
+
 def make_record(
     job_id,
     state="COMPLETED",
@@ -399,6 +458,7 @@ class NodeFilterTests(unittest.TestCase):
         self.assertIn((1, 11, " n Nodes ", 0), screen.writes)
         written = " ".join(write[2] for write in screen.writes)
         self.assertIn(" h History ", written)
+        self.assertIn(" w Priority ", written)
         self.assertNotIn(" r Running ", written)
 
     def test_header_does_not_show_refresh_interval(self):
@@ -2528,6 +2588,690 @@ class HistoryEfficiencyTests(unittest.TestCase):
 
         written = " ".join(write[2] for write in screen.writes)
         self.assertIn(" e efficiency ", written)
+
+
+class PriorityQueueViewTests(unittest.TestCase):
+    def _snapshot(self):
+        factors = PriorityFactors(
+            priority=100,
+            site=0,
+            age=18,
+            association=0,
+            fairshare=51,
+            job_size=4,
+            partition=0,
+            qos=0,
+            tres="cpu=1,mem=1,gres/gpu=25",
+            nice=0,
+        )
+        return make_priority_snapshot(
+            make_priority_job(
+                "900_1", user="alice", account="pi-a", priority=300
+            ),
+            make_priority_job(
+                "901", user="bob", account="pi-b", priority=200
+            ),
+            make_priority_job(
+                "902", reason="Resources", priority=100, factors=factors
+            ),
+        )
+
+    def test_w_is_a_global_priority_shortcut(self):
+        for initial_view in ("jobs", "nodes", "history", "info"):
+            app = VaccsRunningApp(
+                FakeClient(), refresh_seconds=0, initial_view=initial_view
+            )
+
+            self.assertTrue(app._handle_key(None, ord("w")))
+            self.assertEqual(app.state.view, "priority")
+
+    def test_priority_header_is_visible_and_does_not_overlap_clock_at_width_70(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        screen = FakeScreen(height=20, width=70)
+
+        app._draw_header(screen, 70)
+
+        self.assertTrue(any(write[2] == " w Priority " for write in screen.writes))
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn(" e extend ", written)
+        self.assertIn(" f filter ", written)
+        self.assertIn(" g gpu-queue ", written)
+        self.assertNotIn("explain", written)
+        # The optional clock normally starts at column 60; narrow layouts omit it.
+        self.assertFalse(any(write[0] == 1 and write[1] == 60 for write in screen.writes))
+
+    def test_priority_uses_a_slow_refresh_floor_and_zero_still_disables(self):
+        app = VaccsRunningApp(
+            FakeClient(), refresh_seconds=2, initial_view="priority"
+        )
+        self.assertEqual(app._active_refresh_seconds(), PRIORITY_REFRESH_SECONDS)
+
+        slower = VaccsRunningApp(
+            FakeClient(), refresh_seconds=60, initial_view="priority"
+        )
+        self.assertEqual(slower._active_refresh_seconds(), 60)
+
+        disabled = VaccsRunningApp(
+            FakeClient(), refresh_seconds=0, initial_view="priority"
+        )
+        self.assertEqual(disabled._active_refresh_seconds(), 0)
+
+    def test_g_toggles_gpu_work_queues_in_packed_and_extended_views(self):
+        snapshot = make_priority_snapshot(
+            make_priority_job("900", partition="general", user="alice"),
+            make_priority_job("800", partition="nvgpu", user="bob"),
+            make_priority_job("700", partition="gpu-debug", user="carol"),
+            make_priority_job("600", partition="gpu-preempt", user="dave"),
+        )
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        app.state.priority_queue = snapshot
+        app.state.priority_partitions = {"nvgpu"}
+        app.state.selected = 2
+        app.state.scroll = 1
+
+        self.assertTrue(app._handle_key(None, ord("g")))
+
+        self.assertEqual(
+            app.state.priority_partitions,
+            {"nvgpu", "gpu-preempt"},
+        )
+        self.assertEqual(
+            set(PRIORITY_GPU_PARTITIONS),
+            {"nvgpu", "gpu-preempt"},
+        )
+        self.assertEqual(app.state.selected, 0)
+        self.assertEqual(app.state.scroll, 0)
+        self.assertEqual(app.state.message, "GPU partition filter on")
+        self.assertEqual(
+            {entry.job.partition for entry in app._visible_priority_entries()},
+            set(PRIORITY_GPU_PARTITIONS),
+        )
+
+        app.state.priority_extended = True
+        self.assertEqual(
+            {entry.job.partition for entry in app._visible_priority_entries()},
+            set(PRIORITY_GPU_PARTITIONS),
+        )
+
+        self.assertTrue(app._handle_key(None, ord("g")))
+
+        self.assertEqual(app.state.priority_partitions, set())
+        self.assertEqual(app.state.message, "GPU partition filter off")
+        self.assertEqual(app._visible_count(), 4)
+
+    def test_priority_gpu_control_is_highlighted_and_clickable(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        app._pair = lambda pair: pair
+        inactive_screen = FakeScreen(height=20, width=100)
+        app._draw_header(inactive_screen, inactive_screen.width)
+        inactive_attr = next(
+            write[3]
+            for write in inactive_screen.writes
+            if write[2] == " g gpu-queue "
+        )
+
+        gpu_x = (
+            1
+            + len(" e extend ")
+            + 1
+            + len(" f filter ")
+            + 1
+            + 2
+        )
+        click = (0, gpu_x, 3, 0, curses.BUTTON1_CLICKED)
+        with mock.patch("vaccs_running.ui.keys.safe_getmouse", return_value=click):
+            self.assertTrue(app._handle_key(inactive_screen, curses.KEY_MOUSE))
+
+        self.assertEqual(app.state.priority_partitions, set(PRIORITY_GPU_PARTITIONS))
+        active_screen = FakeScreen(height=20, width=100)
+        app._draw_header(active_screen, active_screen.width)
+        active_attr = next(
+            write[3]
+            for write in active_screen.writes
+            if write[2] == " g gpu-queue "
+        )
+        self.assertNotEqual(inactive_attr, active_attr)
+
+    def test_priority_table_and_detail_answer_rank_who_and_why(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        app.state.priority_queue = self._snapshot()
+        app.state.selected = 2
+        screen = FakeScreen(height=42, width=140)
+
+        app._draw_priority(screen, screen.height, screen.width)
+
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn("Packed: 3 rank runs / 3 queue entries", written)
+        self.assertIn("alice", written)
+        self.assertIn("bob", written)
+        self.assertIn("YOU", written)
+        self.assertIn("3/3", written)
+        self.assertIn("Resources", written)
+        self.assertIn("users ahead in snapshot: alice/pi-a×1, bob/pi-b×1", written)
+        self.assertIn("why waiting: Resources", written)
+        self.assertIn("fair-share=51", written)
+        self.assertIn("GPUs=1", written)
+        self.assertIn("CPUs=4", written)
+        self.assertIn("RAM=16G", written)
+        self.assertIn("walltime=1d", written)
+        self.assertIn("backfill", written)
+
+    def test_narrow_priority_table_keeps_core_columns(self):
+        snapshot = self._snapshot()
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        app.state.priority_queue = snapshot
+        screen = FakeScreen(height=40, width=70)
+
+        app._draw_priority_table(
+            screen,
+            app._visible_priority_entries(),
+            snapshot,
+            screen.height,
+            screen.width,
+        )
+
+        headers = {write[2].strip() for write in screen.writes if write[0] == 6}
+        self.assertTrue(
+            {
+                "YOU",
+                "SLOTS",
+                "USER",
+                "PARTITION",
+                "RANK",
+                "GPUS",
+                "CPUS",
+                "RAM",
+                "WALLTIME",
+            }
+            .issubset(headers)
+        )
+        self.assertNotIn("JOB", headers)
+        self.assertNotIn("AHEAD", headers)
+        self.assertNotIn("USERS", headers)
+        self.assertNotIn("EST START", headers)
+        self.assertNotIn("WHY", headers)
+
+    def test_narrow_priority_detail_still_shows_the_pending_reason(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        app.state.priority_queue = self._snapshot()
+        app.state.selected = 2
+        screen = FakeScreen(height=40, width=70)
+
+        app._draw_priority_detail(screen, screen.height, screen.width)
+
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn("why waiting: Resources", written)
+        self.assertIn("use or unavailable", written)
+
+    def test_priority_table_shows_one_array_route_with_a_rank_band(self):
+        snapshot = make_priority_snapshot(
+            make_priority_job("900", user="alice", priority=900),
+            make_priority_job("100_2", priority=700),
+            make_priority_job("100_3", priority=700),
+            make_priority_job("100_4", priority=700),
+        )
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        app.state.priority_queue = snapshot
+        screen = FakeScreen(height=40, width=120)
+
+        app._draw_priority_table(
+            screen,
+            app._visible_priority_entries(),
+            snapshot,
+            screen.height,
+            screen.width,
+        )
+
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn("100_[2-4]", written)
+        self.assertIn("2-4/4", written)
+        self.assertIn("Packed: 2 rank runs / 4 queue entries", written)
+
+    def test_narrow_extended_table_keeps_user_rank_and_reason(self):
+        snapshot = self._snapshot()
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        app.state.priority_queue = snapshot
+        app.state.priority_extended = True
+        screen = FakeScreen(height=40, width=70)
+
+        app._draw_priority_table(
+            screen,
+            app._visible_priority_entries(),
+            snapshot,
+            screen.height,
+            screen.width,
+        )
+
+        headers = {write[2].strip() for write in screen.writes if write[0] == 6}
+        self.assertTrue(
+            {
+                "YOU",
+                "JOBID",
+                "USER",
+                "PARTITION",
+                "RANK",
+                "GPUS",
+                "CPUS",
+                "RAM",
+                "WALLTIME",
+            }
+            .issubset(headers)
+        )
+        self.assertNotIn("ACCOUNT", headers)
+        self.assertNotIn("JOB", headers)
+        self.assertNotIn("EST START", headers)
+        self.assertNotIn("WHY", headers)
+
+    def test_packed_groups_every_users_arrays_and_extend_unpacks_them(self):
+        snapshot = make_priority_snapshot(
+            make_priority_job("900_1", user="alice", priority=900),
+            make_priority_job("900_2", user="alice", priority=900),
+            make_priority_job("800", user="bob", priority=800),
+            make_priority_job("700_1", priority=700),
+            make_priority_job("700_2", priority=700),
+        )
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        app.state.priority_queue = snapshot
+
+        self.assertEqual(app._visible_count(), 3)
+        self.assertEqual(
+            [entry.display_job_id for entry in app._visible_priority_entries()],
+            ["900_[1-2]", "800", "700_[1-2]"],
+        )
+
+        app._handle_key(None, ord("e"))
+        self.assertEqual(app._visible_count(), 5)
+        self.assertEqual(
+            [entry.job.job_id for entry in app._visible_priority_entries()[:2]],
+            ["900_1", "900_2"],
+        )
+
+        app._handle_key(None, ord("e"))
+        self.assertEqual(app._visible_count(), 3)
+        self.assertEqual(app._selected_priority_entry().display_job_id, "900_[1-2]")
+
+    def test_packed_groups_consecutive_same_user_jobs_and_extend_unpacks_them(self):
+        snapshot = make_priority_snapshot(
+            *[
+                make_priority_job(
+                    str(900 + index),
+                    user="fsabokro",
+                    name=f"job-{index}",
+                    priority=900 - index,
+                )
+                for index in range(10)
+            ],
+            make_priority_job("800", user="bob", priority=700),
+        )
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        app.state.priority_queue = snapshot
+
+        self.assertEqual(app._visible_count(), 2)
+        group = app._visible_priority_entries()[0]
+        self.assertEqual(group.display_job_id, "10 jobs")
+        self.assertEqual(group.priority_rank_text, "1-10 of 11")
+
+        screen = FakeScreen(height=42, width=140)
+        app._draw_priority(screen, screen.height, screen.width)
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn("10 jobs", written)
+        self.assertIn("fsabokro", written)
+        self.assertIn("1-10/11", written)
+        self.assertIn("selected rank run", written)
+        self.assertIn(
+            "packed same-user rank run: 10 jobs / 10 consecutive rank slots",
+            written,
+        )
+        self.assertIn("requested across 10 slots: GPUs=10  CPUs=40  RAM=160G", written)
+        self.assertIn("walltime/slot=1d", written)
+        self.assertIn("press e", written)
+
+        app._handle_key(None, ord("e"))
+
+        self.assertEqual(app._visible_count(), 11)
+        self.assertEqual(app._selected_priority_entry().job.job_id, "900")
+
+    def test_packing_selects_the_exact_split_array_group(self):
+        snapshot = make_priority_snapshot(
+            make_priority_job("100_1", reason="Priority", priority=700),
+            make_priority_job("100_2", reason="Dependency", priority=700),
+        )
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        app.state.priority_queue = snapshot
+        app.state.priority_extended = True
+        app.state.selected = 1
+
+        app._handle_key(None, ord("e"))
+
+        self.assertFalse(app.state.priority_extended)
+        self.assertEqual(app.state.selected, 1)
+        self.assertEqual(app._selected_priority_entry().task_job_ids, ("100_2",))
+
+    def test_packing_keeps_selection_in_the_same_reservation_queue(self):
+        snapshot = make_priority_snapshot(
+            make_priority_job("100", reservation="morning"),
+            make_priority_job("100", reservation="evening"),
+        )
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        app.state.priority_queue = snapshot
+        app.state.priority_extended = True
+        app.state.selected = 1
+
+        app._handle_key(None, ord("e"))
+
+        self.assertFalse(app.state.priority_extended)
+        selected = app._selected_priority_entry()
+        self.assertEqual(selected.job.normalized_reservation, "evening")
+
+        screen = FakeScreen(height=40, width=140)
+        app._draw_priority_detail(screen, screen.height, screen.width)
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn("nvgpu / reservation evening", written)
+
+    def test_priority_partition_filter_applies_to_packed_and_extended_rows(self):
+        snapshot = make_priority_snapshot(
+            make_priority_job(
+                "900_1", user="alice", partition="nvgpu", priority=900
+            ),
+            make_priority_job(
+                "900_2", user="alice", partition="nvgpu", priority=900
+            ),
+            make_priority_job(
+                "800", user="bob", partition="nvgpu", priority=800
+            ),
+            make_priority_job(
+                "700", user="carol", partition="gpu-preempt", priority=700
+            ),
+        )
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        app.state.priority_queue = snapshot
+        app.state.priority_partitions = {"nvgpu"}
+
+        self.assertEqual(app._visible_count(), 2)
+        self.assertTrue(
+            all(entry.job.partition == "nvgpu" for entry in app._visible_priority_entries())
+        )
+        self.assertEqual(app._visible_priority_entries()[0].priority_rank_text, "1-2 of 3")
+
+        app._handle_key(None, ord("e"))
+        self.assertEqual(app._visible_count(), 3)
+        self.assertTrue(
+            all(entry.job.partition == "nvgpu" for entry in app._visible_priority_entries())
+        )
+
+        screen = FakeScreen(height=40, width=140)
+        app._draw_priority(screen, screen.height, screen.width)
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn("Extended: 3 queue entries", written)
+        self.assertNotIn("gpu-preempt", written)
+
+    def test_priority_filter_has_partition_as_its_only_option(self):
+        snapshot = make_priority_snapshot(
+            make_priority_job("900", user="alice", partition="custom-gpu")
+        )
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        app.state.priority_queue = snapshot
+
+        items = app._priority_filter_home_items()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["action"], "partition")
+        self.assertEqual(items[0]["label"], "Filter by partition: all")
+        choices = app._priority_filter_choices()
+        self.assertIn("nvgpu", choices.partitions)
+        self.assertIn("custom-gpu", choices.partitions)
+
+    def test_priority_partition_filter_is_independent_from_jobs_filter(self):
+        client = JobsFilterClient()
+        client.set_job_partition_filters({"general"})
+        app = VaccsRunningApp(client, refresh_seconds=0, initial_view="priority")
+        app.state.priority_queue = self._snapshot()
+        app.state.priority_partitions = {"nvgpu"}
+        app.state.selected = 2
+        app.state.scroll = 1
+        choices = app._priority_filter_choices()
+
+        app._activate_priority_partition_filter_item(
+            FakePopupWindow(keys=[]),
+            10,
+            60,
+            choices,
+            {"kind": "partition", "value": "gpu-preempt"},
+        )
+
+        self.assertEqual(app.state.priority_partitions, {"nvgpu", "gpu-preempt"})
+        self.assertEqual(client.job_partitions, {"general"})
+        self.assertEqual(app.state.selected, 0)
+        self.assertEqual(app.state.scroll, 0)
+
+    def test_priority_header_shows_active_partition_filter(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        app.state.priority_partitions = {"nvgpu"}
+        screen = FakeScreen(height=20, width=120)
+
+        app._draw_header(screen, screen.width)
+
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn(" e extend ", written)
+        self.assertIn(" f filter ", written)
+        self.assertIn(" partition: nvgpu ", written)
+
+    def test_f_opens_priority_filter_with_no_jobs_only_options(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        screen = FakeScreen(height=40, width=120)
+        popup = FakePopupWindow(keys=[ord("q")])
+        original_newwin = curses.newwin
+        try:
+            def fake_newwin(height, width, top, left):
+                popup.height = height
+                popup.width = width
+                popup.positions.append((top, left))
+                return popup
+
+            curses.newwin = fake_newwin
+            self.assertTrue(app._handle_key(screen, ord("f")))
+        finally:
+            curses.newwin = original_newwin
+
+        written = " ".join(write[2] for write in popup.writes)
+        self.assertIn("priority filter", written)
+        self.assertIn("Filter by partition: all", written)
+        self.assertNotIn("Filter by status", written)
+        self.assertNotIn("Filter by user", written)
+        self.assertNotIn("Filter by group", written)
+
+    def test_empty_priority_partition_filter_names_the_partition(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        app.state.priority_queue = make_priority_snapshot(
+            make_priority_job("900", user="alice", partition="general")
+        )
+        app.state.priority_partitions = {"nvgpu"}
+        screen = FakeScreen(height=30, width=120)
+
+        app._draw_priority(screen, screen.height, screen.width)
+
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn("No pending queue entries for partition nvgpu.", written)
+
+    def test_clicking_priority_filter_opens_the_partition_only_menu(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        screen = FakeScreen(height=40, width=120)
+        popup = FakePopupWindow(keys=[ord("q")])
+        click = (0, 15, 3, 0, curses.BUTTON1_CLICKED)
+        original_newwin = curses.newwin
+        try:
+            def fake_newwin(height, width, top, left):
+                popup.height = height
+                popup.width = width
+                return popup
+
+            curses.newwin = fake_newwin
+            with mock.patch("vaccs_running.ui.keys.safe_getmouse", return_value=click):
+                self.assertTrue(app._handle_key(screen, curses.KEY_MOUSE))
+        finally:
+            curses.newwin = original_newwin
+
+        written = " ".join(write[2] for write in popup.writes)
+        self.assertIn("priority filter", written)
+        self.assertIn("Filter by partition: all", written)
+
+    def test_unrankable_dependency_explains_that_priority_does_not_release_it(self):
+        snapshot = make_priority_snapshot(
+            make_priority_job("700", reason="Dependency", priority=999)
+        )
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        app.state.priority_queue = snapshot
+        screen = FakeScreen(height=40, width=120)
+
+        app._draw_priority_detail(screen, screen.height, screen.width)
+
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn("No priority rank while Slurm reports Dependency", written)
+        self.assertIn("job dependency has not completed", written)
+
+    def test_priority_refresh_preserves_selected_job_route(self):
+        first = make_priority_snapshot(
+            make_priority_job("1", priority=200),
+            make_priority_job("2", priority=100),
+        )
+        second = make_priority_snapshot(
+            make_priority_job("2", priority=300),
+            make_priority_job("1", priority=200),
+        )
+
+        class PriorityClient(FakeClient):
+            def fetch_priority_queue(self):
+                return second
+
+        app = VaccsRunningApp(
+            PriorityClient(), refresh_seconds=0, initial_view="priority"
+        )
+        app.state.priority_queue = first
+        app.state.selected = 1
+
+        app._refresh_priority()
+
+        self.assertEqual(app.state.selected, 0)
+        self.assertEqual(app._selected_priority_entry().job.job_id, "2")
+
+    def test_priority_refresh_preserves_exact_extended_job(self):
+        first = make_priority_snapshot(
+            make_priority_job("other", user="alice", priority=300),
+            make_priority_job("mine", priority=200),
+        )
+        second = make_priority_snapshot(
+            make_priority_job("mine", priority=400),
+            make_priority_job("other", user="alice", priority=300),
+        )
+
+        class PriorityClient(FakeClient):
+            def fetch_priority_queue(self):
+                return second
+
+        app = VaccsRunningApp(
+            PriorityClient(), refresh_seconds=0, initial_view="priority"
+        )
+        app.state.priority_queue = first
+        app.state.priority_extended = True
+        app.state.selected = 0
+
+        app._refresh_priority()
+
+        self.assertEqual(app.state.selected, 1)
+        self.assertEqual(app._selected_priority_entry().job.job_id, "other")
+
+    def test_priority_refresh_keeps_last_snapshot_on_scheduler_error(self):
+        snapshot = self._snapshot()
+
+        class BrokenPriorityClient(FakeClient):
+            def fetch_priority_queue(self):
+                raise SlurmError("controller busy")
+
+        app = VaccsRunningApp(
+            BrokenPriorityClient(), refresh_seconds=0, initial_view="priority"
+        )
+        app.state.priority_queue = snapshot
+
+        message = app._refresh_priority()
+
+        self.assertIs(app.state.priority_queue, snapshot)
+        self.assertEqual(message, "priority: controller busy")
+
+    def test_e_extends_to_other_jobs_and_packs_again(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        app.state.priority_queue = self._snapshot()
+        app.state.selected = 2
+
+        self.assertTrue(app._handle_key(None, ord("e")))
+
+        self.assertTrue(app.state.priority_extended)
+        self.assertEqual(app._visible_count(), 3)
+        self.assertEqual(app.state.selected, 2)  # keeps the selected own job
+        self.assertEqual(app.state.message, "priority queue extended")
+
+        screen = FakeScreen(height=40, width=140)
+        app._draw_priority(screen, screen.height, screen.width)
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn("Extended: 3 queue entries", written)
+        self.assertIn("alice", written)
+        self.assertIn("bob", written)
+        self.assertIn("YOU", written)
+
+        self.assertTrue(app._handle_key(None, ord("e")))
+        self.assertFalse(app.state.priority_extended)
+        self.assertEqual(app._visible_count(), 3)
+        self.assertEqual(app.state.selected, 2)
+        self.assertEqual(app.state.message, "priority queue packed")
+
+    def test_empty_priority_snapshot_is_clear(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        app.state.priority_queue = FakeClient().fetch_priority_queue()
+        screen = FakeScreen(height=30, width=100)
+
+        app._draw_priority(screen, screen.height, screen.width)
+
+        self.assertIn(
+            "No pending queue entries in the cluster.",
+            " ".join(write[2] for write in screen.writes),
+        )
+
+    def test_packed_and_extended_modes_show_cluster_jobs_when_user_has_none(self):
+        snapshot = make_priority_snapshot(
+            make_priority_job("other", user="alice", priority=300)
+        )
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        app.state.priority_queue = snapshot
+        self.assertEqual(app._visible_count(), 1)
+        self.assertEqual(app._selected_priority_entry().job.user, "alice")
+
+        app._handle_key(None, ord("e"))
+
+        self.assertEqual(app._visible_count(), 1)
+        self.assertEqual(app._selected_priority_entry().job.user, "alice")
+
+    def test_other_users_do_not_claim_a_sprio_factor_breakdown(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        app.state.priority_queue = self._snapshot()
+        app.state.priority_extended = True
+        app.state.selected = 0
+        screen = FakeScreen(height=40, width=140)
+
+        app._draw_priority_detail(screen, screen.height, screen.width)
+
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn("weighted sprio components are queried only for tester", written)
+        self.assertNotIn("weighted sprio breakdown unavailable", written)
+
+    def test_clicking_extend_toggles_the_priority_view(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        app.state.priority_queue = self._snapshot()
+        click = (0, 5, 3, 0, curses.BUTTON1_CLICKED)
+
+        with mock.patch("vaccs_running.ui.keys.safe_getmouse", return_value=click):
+            self.assertTrue(app._handle_key(None, curses.KEY_MOUSE))
+            self.assertTrue(app.state.priority_extended)
+            self.assertTrue(app._handle_key(None, curses.KEY_MOUSE))
+
+        self.assertFalse(app.state.priority_extended)
 
 
 if __name__ == "__main__":

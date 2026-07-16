@@ -2,7 +2,111 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from ..slurm import Job, JobRecordGroup
+from ..slurm import Job, JobRecordGroup, PriorityQueueEntry
+
+
+def priority_rank_text(entry: PriorityQueueEntry) -> str:
+    if entry.priority_rank is None or entry.rank_total is None:
+        return "—"
+    if entry.rank_end is not None and entry.rank_end != entry.priority_rank:
+        return f"{entry.priority_rank}-{entry.rank_end}/{entry.rank_total}"
+    return f"{entry.priority_rank}/{entry.rank_total}"
+
+
+def responsive_priority_specs(
+    available_width: int,
+    *,
+    extended: bool = False,
+    current_user: str = "",
+) -> list[tuple[str, int, int, Callable[[PriorityQueueEntry], str]]]:
+    """Priority columns, retaining rank and requested resources when narrow."""
+    if extended:
+        specs: list[
+            tuple[str, int, int, Callable[[PriorityQueueEntry], str]]
+        ] = [
+            (
+                "YOU",
+                3,
+                3,
+                lambda entry: "YOU" if entry.job.user == current_user else "",
+            ),
+            ("JOBID", 10, 24, lambda entry: entry.display_job_id),
+            ("USER", 6, 16, lambda entry: entry.job.user or "-"),
+            ("ACCOUNT", 6, 20, lambda entry: entry.job.account or "-"),
+            ("JOB", 10, 28, lambda entry: entry.display_name),
+            ("PARTITION", 8, 24, lambda entry: entry.job.queue_label),
+            ("RANK", 7, 13, priority_rank_text),
+            ("GPUS", 4, 7, lambda entry: entry.display_gpus),
+            ("CPUS", 4, 7, lambda entry: entry.display_cpus),
+            ("RAM", 5, 9, lambda entry: entry.display_memory),
+            ("WALLTIME", 8, 15, lambda entry: entry.display_walltime),
+            (
+                "PRIORITY",
+                8,
+                12,
+                lambda entry: entry.display_priority,
+            ),
+            ("WHY", 16, 38, lambda entry: entry.display_reason),
+            ("EST START", 16, 20, lambda entry: entry.display_estimated_start),
+        ]
+        for removable in (
+            "EST START",
+            "JOB",
+            "ACCOUNT",
+            "PRIORITY",
+            "WHY",
+        ):
+            if minimum_table_width(label_widths(specs)) <= available_width:
+                return specs
+            specs = [spec for spec in specs if spec[0] != removable]
+        return specs
+
+    specs: list[tuple[str, int, int, Callable[[PriorityQueueEntry], str]]] = [
+        (
+            "YOU",
+            3,
+            3,
+            lambda entry: "YOU" if entry.job.user == current_user else "",
+        ),
+        ("SLOTS", 10, 24, lambda entry: entry.display_job_id),
+        ("USER", 6, 16, lambda entry: entry.job.user or "-"),
+        ("JOB", 10, 28, lambda entry: entry.display_name),
+        ("PARTITION", 8, 24, lambda entry: entry.job.queue_label),
+        ("RANK", 7, 13, priority_rank_text),
+        ("GPUS", 4, 7, lambda entry: entry.display_gpus),
+        ("CPUS", 4, 7, lambda entry: entry.display_cpus),
+        ("RAM", 5, 9, lambda entry: entry.display_memory),
+        ("WALLTIME", 8, 15, lambda entry: entry.display_walltime),
+        (
+            "PRIORITY",
+            8,
+            12,
+            lambda entry: entry.display_priority,
+        ),
+        ("AHEAD", 5, 7, lambda entry: str(entry.earlier_count)),
+        (
+            "USERS",
+            5,
+            7,
+            lambda entry: str(entry.earlier_user_count),
+        ),
+        ("WHY", 16, 38, lambda entry: entry.display_reason),
+        ("EST START", 16, 20, lambda entry: entry.display_estimated_start),
+    ]
+    # At the supported 70-column minimum, identity and rank are more useful
+    # than duplicate detail/count columns. Wider screens retain everything.
+    for removable in (
+        "EST START",
+        "JOB",
+        "USERS",
+        "AHEAD",
+        "PRIORITY",
+        "WHY",
+    ):
+        if minimum_table_width(label_widths(specs)) <= available_width:
+            return specs
+        specs = [spec for spec in specs if spec[0] != removable]
+    return specs
 
 
 def leaderboard_columns(

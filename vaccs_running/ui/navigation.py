@@ -7,12 +7,42 @@ from ..slurm import (
     Job,
     JobRecordGroup,
     Node,
+    PriorityQueueEntry,
     group_job_records,
     record_from_job,
 )
 
 
 class NavigationMixin:
+    def _filter_priority_entries(
+        self,
+        entries: tuple[PriorityQueueEntry, ...] | list[PriorityQueueEntry],
+    ) -> list[PriorityQueueEntry]:
+        partitions = self.state.priority_partitions
+        if not partitions:
+            return list(entries)
+        return [entry for entry in entries if entry.job.partition in partitions]
+
+    def _visible_priority_grouped_entries(self) -> list[PriorityQueueEntry]:
+        snapshot = self.state.priority_queue
+        if snapshot is None:
+            return []
+        # Fall back to my_jobs for compatibility with snapshots created before
+        # cluster-wide packed groups were added.
+        grouped = snapshot.grouped_entries or snapshot.my_jobs
+        return self._filter_priority_entries(grouped)
+
+    def _visible_priority_all_entries(self) -> list[PriorityQueueEntry]:
+        snapshot = self.state.priority_queue
+        if snapshot is None:
+            return []
+        return self._filter_priority_entries(snapshot.all_entries)
+
+    def _visible_priority_entries(self) -> list[PriorityQueueEntry]:
+        if self.state.priority_extended:
+            return self._visible_priority_all_entries()
+        return self._visible_priority_grouped_entries()
+
     def _visible_jobs(self) -> list[Job]:
         if self._jobs_filter_active():
             return self.state.jobs
@@ -38,6 +68,8 @@ class NavigationMixin:
     def _visible_count(self) -> int:
         if self.state.view in {"leaderboard", "info"}:
             return 0
+        if self.state.view == "priority":
+            return len(self._visible_priority_entries())
         if self.state.view == "nodes":
             return len(self._visible_nodes())
         if self.state.view == "history":
@@ -113,6 +145,13 @@ class NavigationMixin:
 
     def _selected_node(self) -> Node | None:
         visible = self._visible_nodes()
+        if not visible:
+            return None
+        self._clamp_selection()
+        return visible[self.state.selected]
+
+    def _selected_priority_entry(self) -> PriorityQueueEntry | None:
+        visible = self._visible_priority_entries()
         if not visible:
             return None
         self._clamp_selection()

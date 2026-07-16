@@ -75,6 +75,16 @@ BUSY_JOBS_REFRESH_SECONDS = 5.0
 BUSY_JOBS_REFRESH_THRESHOLD = 50
 
 
+# The Priority view includes a sprio RPC in addition to its queue snapshot.
+# Slurm explicitly discourages calling sprio in tight loops, so keep this view
+# substantially slower than the lightweight per-user Jobs refresh.
+PRIORITY_REFRESH_SECONDS = 30.0
+
+
+# Priority's one-key GPU queue shortcut intentionally excludes gpu-debug.
+PRIORITY_GPU_PARTITIONS = ("nvgpu", "gpu-preempt")
+
+
 HISTORY_FILTER_OPTIONS = [
     ("1h", "last 1 hour"),
     ("3h", "last 3 hours"),
@@ -135,3 +145,16 @@ INFO_TOP = 5
 
 
 SPINNER_FRAMES = "|/-\\"
+
+
+# One source of truth for the visible top-level tabs and their global keys.
+# Keep the established tabs in place and append Priority so existing muscle
+# memory and narrow-terminal layouts do not shift unexpectedly.
+TOP_TABS = (
+    ("jobs", "j", "Jobs"),
+    ("nodes", "n", "Nodes"),
+    ("history", "h", "History"),
+    ("leaderboard", "u", "Usage"),
+    ("info", "i", "Info"),
+    ("priority", "w", "Priority"),
+)

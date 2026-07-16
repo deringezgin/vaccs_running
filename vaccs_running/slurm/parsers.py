@@ -3,7 +3,10 @@ from __future__ import annotations
 from .constants import (
     GPU_TRES_NAMES,
     NODE_JOBS_FIELDS,
+    PRIORITY_QUEUE_FIELDS,
+    PRIORITY_QUEUE_LONG_FIELDS,
     SACCT_FIELDS,
+    SPRIO_FIELDS,
     SQUEUE_FIELDS,
 )
 from .primitives import (
@@ -16,6 +19,7 @@ from .primitives import (
     parse_int,
     parse_key_values,
     parse_level_fairshare_value,
+    parse_optional_int,
     parse_reqmem_bytes,
     parse_storage_size,
     parse_tres_value,
@@ -27,8 +31,142 @@ from .models import (
     Job,
     JobRecord,
     Node,
+    PriorityFactors,
+    PriorityQueueJob,
     UsageEntry,
 )
+
+
+def parse_priority_queue_line(line: str) -> PriorityQueueJob:
+    """Parse one delimiter-safe row from the priority ``squeue`` snapshot."""
+    parts = line.rstrip("\n").split("|")
+    if len(parts) < len(PRIORITY_QUEUE_FIELDS):
+        parts.extend([""] * (len(PRIORITY_QUEUE_FIELDS) - len(parts)))
+    elif len(parts) > len(PRIORITY_QUEUE_FIELDS):
+        head = parts[: len(PRIORITY_QUEUE_FIELDS) - 1]
+        tail = "|".join(parts[len(PRIORITY_QUEUE_FIELDS) - 1 :])
+        parts = [*head, tail]
+
+    values = {
+        field: value.strip()
+        for field, value in zip(PRIORITY_QUEUE_FIELDS, parts)
+    }
+    return PriorityQueueJob(
+        job_id=values["job_id"],
+        user=values["user"],
+        name=values["name"],
+        partition=values["partition"],
+        state=values["state"],
+        reason=values["reason"],
+        priority=parse_optional_int(values["priority"]),
+        account=values["account"],
+        qos=values["qos"],
+        submit_time=values["submit_time"],
+        start_time=values["start_time"],
+        reservation=values["reservation"],
+        node_count=values["node_count"],
+        cpus=values["cpus"],
+        gres=values["gres"],
+        requested_tres="",
+        limit=values["limit"],
+    )
+
+
+def parse_priority_queue_long_line(line: str) -> PriorityQueueJob:
+    """Parse the cluster-wide long-format queue row with pending ReqTRES."""
+    value = line.rstrip("\n")
+    if value.endswith("|"):
+        value = value[:-1]
+    parts = value.split("|")
+    if len(parts) < len(PRIORITY_QUEUE_LONG_FIELDS):
+        parts.extend([""] * (len(PRIORITY_QUEUE_LONG_FIELDS) - len(parts)))
+    elif len(parts) > len(PRIORITY_QUEUE_LONG_FIELDS):
+        head = parts[: len(PRIORITY_QUEUE_LONG_FIELDS) - 1]
+        tail = "|".join(parts[len(PRIORITY_QUEUE_LONG_FIELDS) - 1 :])
+        parts = [*head, tail]
+    values = {
+        field: value.strip()
+        for field, value in zip(PRIORITY_QUEUE_LONG_FIELDS, parts)
+    }
+
+    job_id = values["job_id"]
+    array_task = values["array_task_id"]
+    if array_task and array_task.upper() not in {
+        "N/A",
+        "NONE",
+        "(NULL)",
+        "4294967294",
+    }:
+        job_id = f"{job_id}_{array_task}"
+
+    return PriorityQueueJob(
+        job_id=job_id,
+        user=values["user"],
+        name=values["name"],
+        partition=values["partition"],
+        state=values["state"],
+        reason=values["reason"],
+        priority=parse_optional_int(values["priority"]),
+        account=values["account"],
+        qos=values["qos"],
+        submit_time=values["submit_time"],
+        start_time=values["start_time"],
+        reservation=values["reservation"],
+        node_count=values["node_count"],
+        cpus=values["cpus"],
+        gres="",
+        requested_tres=values["requested_tres"],
+        limit=values["limit"],
+    )
+
+
+def parse_sprio_line(line: str) -> tuple[str, str, PriorityFactors]:
+    """Parse weighted sprio factors, tolerating omitted/blank plugin fields."""
+    parts = line.rstrip("\n").split("|")
+    if len(parts) < len(SPRIO_FIELDS):
+        parts.extend([""] * (len(SPRIO_FIELDS) - len(parts)))
+    values = {
+        field: value.strip()
+        for field, value in zip(SPRIO_FIELDS, parts[: len(SPRIO_FIELDS)])
+    }
+    return (
+        values["job_id"],
+        values["partition"],
+        PriorityFactors(
+            priority=parse_optional_int(values["priority"]),
+            site=parse_optional_int(values["site"]),
+            age=parse_optional_int(values["age"]),
+            association=parse_optional_int(values["association"]),
+            fairshare=parse_optional_int(values["fairshare"]),
+            job_size=parse_optional_int(values["job_size"]),
+            partition=parse_optional_int(values["partition_factor"]),
+            qos=parse_optional_int(values["qos_factor"]),
+            tres=values["tres"],
+            nice=parse_optional_int(values["nice"]),
+        ),
+    )
+
+
+def parse_priority_tres(output: str) -> dict[str, str]:
+    """Requested TRES keyed by expanded job ID from ``squeue -O`` output."""
+    requested: dict[str, str] = {}
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        parts = line.rstrip("\n").split("|", 3)
+        parts.extend([""] * max(0, 3 - len(parts)))
+        job_id, array_task, tres = (part.strip() for part in parts[:3])
+        if not job_id:
+            continue
+        if array_task and array_task.upper() not in {
+            "N/A",
+            "NONE",
+            "(NULL)",
+            "4294967294",
+        }:
+            job_id = f"{job_id}_{array_task}"
+        requested[job_id] = tres
+    return requested
 
 
 def parse_gpfs_quota(output: str, user: str = "") -> GpfsQuota:

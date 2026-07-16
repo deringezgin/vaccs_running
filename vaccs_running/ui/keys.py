@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import curses
 
+from .curses_compat import safe_getmouse
 from .constants import (
     HISTORY_FILTER_OPTIONS,
     LEADERBOARD_PAGE,
+    TOP_TABS,
 )
 from ..slurm import (
     HISTORY_WINDOWS,
@@ -15,6 +17,9 @@ from ..slurm import (
 
 class KeyHandlingMixin:
     def _handle_key(self, stdscr: curses.window, key: int) -> bool:
+        if key == curses.KEY_MOUSE:
+            self._handle_mouse(stdscr)
+            return True
         # While the Usage find box is open, every keystroke edits the query
         # (so typing 'q', 'j', etc. filters instead of quitting/switching).
         if self.state.view == "leaderboard" and self.state.leaderboard_filter_editing:
@@ -25,13 +30,7 @@ class KeyHandlingMixin:
         # View shortcuts are global. Handle them before view-local keys so a
         # tab cannot accidentally consume its own escape route (for example,
         # Info previously treated "j" as scroll-down instead of Jobs).
-        view_shortcuts = {
-            ord("n"): "nodes",
-            ord("h"): "history",
-            ord("j"): "jobs",
-            ord("u"): "leaderboard",
-            ord("i"): "info",
-        }
+        view_shortcuts = {ord(key_name): view for view, key_name, _ in TOP_TABS}
         if key in view_shortcuts:
             self._switch_view(view_shortcuts[key])
             return True
@@ -71,6 +70,8 @@ class KeyHandlingMixin:
                 self.state.scroll = 0
                 state = "on" if self.state.jobs_grouped else "off"
                 self.state.message = f"job grouping {state}"
+            elif self.state.view == "priority":
+                self._toggle_priority_gpu_filter()
         elif key == ord("f"):
             if self.state.view == "nodes":
                 enabled = not self.state.free_gpu_only
@@ -83,6 +84,8 @@ class KeyHandlingMixin:
                 self.state.message = f"free GPU filter {state}"
             elif self.state.view == "jobs":
                 self._show_jobs_filter(stdscr)
+            elif self.state.view == "priority":
+                self._show_priority_filter(stdscr)
             elif self.state.view == "history":
                 self._cycle_history_window()
         elif key == ord("d"):
@@ -97,9 +100,90 @@ class KeyHandlingMixin:
         elif key == ord("e"):
             if self.state.view == "history":
                 self._show_job_efficiency(stdscr)
+            elif self.state.view == "priority":
+                self._toggle_priority_extended()
 
         self._clamp_selection()
         return True
+
+    def _handle_mouse(self, stdscr: curses.window) -> None:
+        mouse = safe_getmouse()
+        if not mouse:
+            return
+        _, mouse_x, mouse_y, _, button_state = mouse
+        left_click = curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED
+        if self.state.view != "priority" or mouse_y != 3:
+            return
+        if not button_state & left_click:
+            return
+
+        extend_x = 1
+        extend_text = " e extend "
+        if extend_x <= mouse_x < extend_x + len(extend_text):
+            self._toggle_priority_extended()
+            return
+
+        filter_x = extend_x + len(extend_text) + 1
+        filter_text = " f filter "
+        if filter_x <= mouse_x < filter_x + len(filter_text):
+            self._show_priority_filter(stdscr)
+            return
+
+        gpu_x = filter_x + len(filter_text) + 1
+        gpu_text = " g gpu-queue "
+        if gpu_x <= mouse_x < gpu_x + len(gpu_text):
+            self._toggle_priority_gpu_filter()
+
+    def _toggle_priority_extended(self) -> None:
+        selected = self._selected_priority_entry()
+        selected_job_id = selected.job.job_id if selected is not None else ""
+        selected_task_ids = (
+            set(selected.task_job_ids) if selected is not None else set()
+        )
+        if selected is not None and not selected_task_ids:
+            selected_task_ids.add(selected.job.job_id)
+        selected_parent = selected.job.array_parent if selected is not None else ""
+        selected_partition = selected.job.partition if selected is not None else ""
+        selected_reservation = (
+            selected.job.normalized_reservation if selected is not None else ""
+        )
+
+        self.state.priority_extended = not self.state.priority_extended
+        self.state.selected = 0
+        self.state.scroll = 0
+        visible = self._visible_priority_entries()
+        if self.state.priority_extended:
+            for index, entry in enumerate(visible):
+                if (
+                    entry.job.job_id == selected_job_id
+                    and entry.job.partition == selected_partition
+                    and entry.job.normalized_reservation == selected_reservation
+                ):
+                    self.state.selected = index
+                    break
+        else:
+            fallback_index: int | None = None
+            for index, entry in enumerate(visible):
+                same_partition = entry.job.partition == selected_partition
+                same_scope = (
+                    same_partition
+                    and entry.job.normalized_reservation == selected_reservation
+                )
+                entry_task_ids = set(entry.task_job_ids) or {entry.job.job_id}
+                if bool(selected_task_ids & entry_task_ids) and same_scope:
+                    self.state.selected = index
+                    break
+                if fallback_index is None and (
+                    entry.job.array_parent == selected_parent
+                    and same_scope
+                ):
+                    fallback_index = index
+            else:
+                if fallback_index is not None:
+                    self.state.selected = fallback_index
+
+        mode = "extended" if self.state.priority_extended else "packed"
+        self.state.message = f"priority queue {mode}"
 
     def _handle_info_key(self, key: int) -> bool:
         """Info-tab keys: refresh + scroll. Returns False so tab keys pass through."""

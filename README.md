@@ -7,7 +7,9 @@
   </a>
 </p>
 
-A colorful terminal UI for checking your jobs on the Vermont Advanced Computing Cluster, viewing node availability, and browsing per-user cluster usage.
+A colorful terminal UI for checking your jobs and their priority on the Vermont
+Advanced Computing Cluster, viewing node availability, and browsing per-user
+cluster usage.
 
 > This project is not affiliated in any way with UVM, VACC, or the Vermont Complex Systems Institute.
 
@@ -50,7 +52,7 @@ To prefilter the Jobs view by Slurm state, group, or partition:
 
 ## Features
 
-The TUI has five tabs, switched with a single key at any time:
+The TUI has six tabs, switched with a single key at any time:
 
 | Key | Tab | What it shows |
 | --- | --- | --- |
@@ -59,6 +61,7 @@ The TUI has five tabs, switched with a single key at any time:
 | `h` | **History** | your recently finished jobs |
 | `u` | **Usage** | a per-user cluster-usage leaderboard |
 | `i` | **Info** | your account, compute usage, and storage |
+| `w` | **Priority** | where your pending jobs rank and why they are waiting |
 
 Keys shared by the list views:
 
@@ -70,8 +73,9 @@ Keys shared by the list views:
 
 Job and node state is color-coded (green = running/idle, yellow = pending/mixed,
 cyan = completed/allocated, red = failed/down). Jobs, Nodes, and History
-auto-refresh while you are on them (roughly on the `--refresh` interval); Usage
-and Info are refresh-on-demand only.
+auto-refresh while you are on them (roughly on the `--refresh` interval).
+Priority also auto-refreshes, but no faster than every 30 seconds because
+`sprio` is a scheduler RPC. Usage and Info are refresh-on-demand only.
 
 <details>
 <summary><strong>Jobs</strong> (<code>j</code>)</summary>
@@ -88,6 +92,38 @@ columns first.
 You can also preselect these filters at launch (see [Quick Start](#quick-start)):
 `--user`/`-u`, `--group`/`-g`, `--partition`/`-p`, `--state`/`-s`, and `--admin`
 (all users' running and pending jobs).
+
+</details>
+
+<details>
+<summary><strong>Priority</strong> (<code>w</code>)</summary>
+
+Packed mode shows the literal pending priority queue from every user. Within
+each partition/reservation it covers rank slots `1` through `N` exactly once,
+folding only adjacent slots owned by the same user into a run (for example, ten
+consecutive jobs become one `10 jobs` row ranked `2-11/N`). It never groups
+across another user's slot, a partition, or a reservation. Ranked runs are shown
+first; holds, dependencies, and other jobs outside the schedulable
+Priority/Resources queue remain visible as unranked rows afterward. Each row
+shows requested GPUs, CPUs, total RAM, and requested walltime; packed runs sum
+GPU/CPU/RAM across their slots and show a common walltime or its range. Your
+rows are marked `YOU`.
+
+- `e` — **extend** the view to unpack every pending rank slot from every user.
+  Press `e` (or click **extend**) again to return to the cluster-wide packed
+  queue.
+- `g` — show the combined `nvgpu` and `gpu-preempt` queues. Press `g` again to
+  return to all partitions; `gpu-debug` remains available through `f`.
+- `f` — **filter** the Priority queue by one or more partitions. Partition is
+  the only Priority filter for now; for example, select `nvgpu` to see its full
+  `1` through `N` queue, then use `e` for every individual rank slot.
+
+Priority rank is a snapshot, not a guaranteed start order. A lower-ranked job
+can start first when its CPU, memory, GPU, feature, reservation, or time request
+fits without delaying higher-priority work. Likewise, a high-priority job held
+by a dependency or policy limit is not necessarily blocking yours. Slurm reports
+only the first pending reason it encounters, so the view labels it as the
+current reason rather than a complete diagnosis.
 
 </details>
 

@@ -5,6 +5,7 @@ import getpass
 import os
 import shlex
 import subprocess
+import time
 from typing import Iterable
 
 from .constants import (
@@ -14,11 +15,13 @@ from .constants import (
     JOB_EFFICIENCY_WINDOW,
     JOB_EFFICIENCY_WINDOW_LABEL,
     NODE_JOBS_FORMAT,
+    PRIORITY_QUEUE_LONG_FORMAT,
     SACCT_FORMAT,
     SQUEUE_FORMAT,
     SREPORT_USAGE_FORMAT,
     SREPORT_USAGE_REPORT,
     SSHARE_FAIRSHARE_FORMAT,
+    SPRIO_FORMAT,
     SlurmError,
     USAGE_TRES,
     VACC_PARTITIONS,
@@ -38,16 +41,20 @@ from .models import (
     JobFilterChoices,
     JobRecord,
     Node,
+    PriorityFactors,
+    PriorityQueueSnapshot,
     UsageEntry,
 )
 from .parsers import (
     parse_gpfs_quota,
     parse_node_job_line,
+    parse_priority_queue_long_line,
     parse_sacct_records,
     parse_scontrol_job_usage,
     parse_scontrol_nodes,
     parse_squeue_line,
     parse_sreport_usage,
+    parse_sprio_line,
     parse_sshare_scores,
     record_from_job,
     summarize_job_efficiency,
@@ -56,12 +63,16 @@ from .aggregate import (
     active_job_keys,
     active_jobs_start,
     aggregate_user_usage,
+    build_priority_queue_snapshot,
     format_user_usage,
     free_gpu_count,
     job_record_sort_key,
     records_for_active_jobs,
     stranded_gpu_count,
 )
+
+
+PRIORITY_FACTORS_CACHE_SECONDS = 60.0
 
 
 class CommandRunner:
@@ -97,6 +108,11 @@ class SlurmClient:
         self.job_all_principals = False
         self.squeue_states = normalize_squeue_states(states)
         self.runner = CommandRunner()
+        self._priority_factor_records: list[
+            tuple[str, str, PriorityFactors]
+        ] = []
+        self._priority_factors_checked_at: float | None = None
+        self._priority_factors_error = ""
 
     @property
     def state_filter_active(self) -> bool:
@@ -199,6 +215,98 @@ class SlurmClient:
                 continue
             jobs.append(parse_squeue_line(line))
         return self._filter_jobs_by_partitions(self._filter_jobs_by_principals(jobs))
+
+    def fetch_priority_queue(self) -> PriorityQueueSnapshot:
+        """Cluster-wide pending jobs plus requested resources and user factors.
+
+        ``squeue --priority`` supplies the order Slurm considers for scheduling.
+        Only rows whose reason is Priority/Resources receive a rank; jobs held
+        by dependencies, user/admin holds, or policy/configuration limits are
+        kept visible but excluded from the list of blockers. Multifactor
+        details are queried only for this user and cached to avoid repeatedly
+        sending the comparatively expensive sprio RPC to slurmctld.
+        """
+        output = self.runner.run(
+            [
+                "squeue",
+                "--array",
+                "--all",
+                "-h",
+                "-t",
+                "PD",
+                "--priority",
+                "--sort=-p,i",
+                "-O",
+                PRIORITY_QUEUE_LONG_FORMAT,
+            ],
+            timeout=20.0,
+        )
+        jobs = [
+            parse_priority_queue_long_line(line)
+            for line in output.splitlines()
+            if line.strip()
+        ]
+        if not any(job.user == self.user for job in jobs):
+            return build_priority_queue_snapshot(
+                self.user,
+                jobs,
+                factors_available=True,
+            )
+
+        factor_records, factors_available, factors_error = (
+            self._fetch_priority_factor_records()
+        )
+        return build_priority_queue_snapshot(
+            self.user,
+            jobs,
+            factor_records,
+            factors_available=factors_available,
+            factors_error=factors_error,
+        )
+
+    def _fetch_priority_factor_records(
+        self,
+    ) -> tuple[list[tuple[str, str, PriorityFactors]], bool, str]:
+        now = time.monotonic()
+        if (
+            self._priority_factors_checked_at is not None
+            and now - self._priority_factors_checked_at
+            < PRIORITY_FACTORS_CACHE_SECONDS
+        ):
+            return (
+                list(self._priority_factor_records),
+                bool(self._priority_factor_records),
+                self._priority_factors_error,
+            )
+
+        records: list[tuple[str, str, PriorityFactors]] = []
+        error = ""
+        try:
+            output = self.runner.run(
+                [
+                    "sprio",
+                    "-h",
+                    "-u",
+                    self.user,
+                    "-o",
+                    SPRIO_FORMAT,
+                ],
+                timeout=20.0,
+            )
+            records = [
+                parse_sprio_line(line)
+                for line in output.splitlines()
+                if line.strip()
+            ]
+            if not records:
+                error = "sprio returned no multifactor priority data"
+        except SlurmError as exc:
+            error = str(exc)
+
+        self._priority_factor_records = records
+        self._priority_factors_checked_at = now
+        self._priority_factors_error = error
+        return list(records), bool(records), error
 
     def _query_users(self) -> set[str] | None:
         if self.job_all_principals or self.job_groups:
