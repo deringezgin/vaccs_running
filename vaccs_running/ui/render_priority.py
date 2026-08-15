@@ -18,7 +18,7 @@ from ..slurm import PriorityQueueEntry, PriorityQueueJob, PriorityQueueSnapshot
 def _ahead_user_summary(
     entry: PriorityQueueEntry,
     current_user: str,
-    pending_jobs: tuple[PriorityQueueJob, ...],
+    all_entries: tuple[PriorityQueueEntry, ...],
     limit: int = 4,
 ) -> str:
     if entry.priority_rank is None or entry.priority_rank <= 1:
@@ -27,8 +27,13 @@ def _ahead_user_summary(
     if reservation.upper() in {"N/A", "NONE", "(NULL)"}:
         reservation = ""
     ahead: list[PriorityQueueJob] = []
-    for job in pending_jobs:
-        if not job.is_rankable or job.partition != entry.job.partition:
+    for candidate in all_entries:
+        job = candidate.job
+        if (
+            candidate.priority_rank is None
+            or candidate.priority_rank >= entry.priority_rank
+            or job.partition != entry.job.partition
+        ):
             continue
         job_reservation = job.reservation
         if job_reservation.upper() in {"N/A", "NONE", "(NULL)"}:
@@ -36,8 +41,6 @@ def _ahead_user_summary(
         if job_reservation != reservation:
             continue
         ahead.append(job)
-        if len(ahead) >= entry.priority_rank - 1:
-            break
     counts = Counter(
         (job.user or "unknown", job.account or "")
         for job in ahead
@@ -66,14 +69,19 @@ def _priority_factor_text(
 ) -> str:
     priority = entry.display_priority
     if entry.is_consecutive_user_group:
+        group_kind = (
+            "unranked pending entries"
+            if entry.priority_rank is None
+            else "consecutive rank slots"
+        )
         if entry.job.user != current_user:
             return (
-                f"priority={priority}; press e for each job's priority; weighted "
+                f"reported priority={priority}; press e for each entry; weighted "
                 f"sprio components are queried only for {current_user}"
             )
         return (
-            f"priority={priority}; this packed row combines consecutive rank slots; "
-            "press e for each job's weighted sprio components"
+            f"reported priority={priority}; this packed row combines {group_kind}; "
+            "press e for each entry's weighted sprio components"
         )
     if entry.job.user != current_user:
         return (
@@ -157,7 +165,10 @@ class RenderPriorityMixin:
                     f"{'runs' if queue_groups != 1 else 'run'}"
                 )
                 if unranked:
-                    group_label += f" + {unranked} unranked"
+                    group_label += (
+                        f" + {unranked} unranked "
+                        f"{'groups' if unranked != 1 else 'group'}"
+                    )
                 title = (
                     f" Packed: {group_label} / {entry_label} · "
                     f"yours: {task_label} "
@@ -236,11 +247,14 @@ class RenderPriorityMixin:
         top = max(4, height - panel_height)
         snapshot = self.state.priority_queue
         entry = self._selected_priority_entry()
-        panel_title = (
-            " selected rank run "
-            if entry is not None and entry.is_consecutive_user_group
-            else " selected pending job "
-        )
+        if entry is not None and entry.is_consecutive_user_group:
+            panel_title = (
+                " selected rank run "
+                if entry.priority_rank is not None
+                else " selected unranked group "
+            )
+        else:
+            panel_title = " selected pending job "
         self._draw_box(stdscr, top, 0, panel_height, width, panel_title)
         if snapshot is None:
             self._addstr(stdscr, top + 1, 2, "Loading priority queue…", self._pair(2))
@@ -280,16 +294,24 @@ class RenderPriorityMixin:
                 "YOU marks your jobs"
             )
         else:
-            ahead = _ahead_user_summary(entry, snapshot.user, snapshot.pending_jobs)
+            ahead = _ahead_user_summary(entry, snapshot.user, snapshot.all_entries)
             if entry.is_consecutive_user_group:
                 job_label = (
                     f"{entry.job_count} job"
                     f"{'s' if entry.job_count != 1 else ''}"
                 )
-                context_line = (
-                    f"packed same-user rank run: {job_label} / "
-                    f"{entry.task_count} consecutive rank slots; users ahead: {ahead}"
-                )
+                if entry.priority_rank is None:
+                    context_line = (
+                        f"packed same-user unranked group: {job_label} / "
+                        f"{entry.task_count} pending entries; no priority rank "
+                        "or ahead count"
+                    )
+                else:
+                    context_line = (
+                        f"packed same-user rank run: {job_label} / "
+                        f"{entry.task_count} consecutive rank slots; "
+                        f"users ahead: {ahead}"
+                    )
             else:
                 context_line = f"users ahead in snapshot: {ahead}"
 
@@ -298,8 +320,10 @@ class RenderPriorityMixin:
             id_summary = group_ids[0]
             if len(group_ids) > 1:
                 id_summary += f"…{group_ids[-1]}"
+            entry_label = "slots" if entry.priority_rank is not None else "entries"
             identity_line = (
-                f"{entry.display_name}  slots={entry.display_job_id}  ids={id_summary}  "
+                f"{entry.display_name}  {entry_label}={entry.display_job_id}  "
+                f"ids={id_summary}  "
                 f"partition={job.partition}  user={job.user or '-'}"
             )
             if len(entry.group_reason_codes) > 1:
@@ -311,10 +335,13 @@ class RenderPriorityMixin:
                 why_line = (
                     f"why waiting: {entry.display_reason} — {job.reason_explanation}"
                 )
+            request_unit = "slots" if entry.priority_rank is not None else "entries"
+            walltime_unit = "slot" if entry.priority_rank is not None else "entry"
             request_line = (
-                f"requested across {entry.task_count} slots: "
+                f"requested across {entry.task_count} {request_unit}: "
                 f"GPUs={entry.display_gpus}  CPUs={entry.display_cpus}  "
-                f"RAM={entry.display_memory}; walltime/slot={entry.display_walltime}"
+                f"RAM={entry.display_memory}; "
+                f"walltime/{walltime_unit}={entry.display_walltime}"
             )
         else:
             identity_line = (

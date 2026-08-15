@@ -35,6 +35,7 @@ from vaccs_running.ui import (
     leaderboard_too_small,
     page_status,
     popup_geometry,
+    responsive_priority_specs,
     resource_count_width,
     resource_meter,
     resource_text_meter,
@@ -1344,6 +1345,33 @@ class NodeFilterTests(unittest.TestCase):
             ["4413548_2", "4413548_3"],
         )
         self.assertNotIn("9999999_1", [job.job_id for job in app._visible_jobs()])
+
+    def test_jobs_are_sorted_by_job_id_ascending(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        app.state.jobs = [
+            make_job("100_10", "PENDING"),
+            make_job("20", "RUNNING"),
+            make_job("100_2", "RUNNING"),
+            make_job("3", "PENDING"),
+        ]
+
+        self.assertEqual(
+            [job.job_id for job in app._visible_jobs()],
+            ["3", "20", "100_2", "100_10"],
+        )
+
+    def test_grouped_jobs_are_sorted_by_job_id_ascending(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        app.state.job_records = [
+            make_record("100_1", "RUNNING", name="last"),
+            make_record("20_1", "PENDING", name="middle"),
+            make_record("3_1", "RUNNING", name="first"),
+        ]
+
+        self.assertEqual(
+            [group.array_parent for group in app._visible_job_groups()],
+            ["3", "20", "100"],
+        )
 
     def test_state_prefiltered_jobs_are_not_filtered_again_by_ui(self):
         client = StateFilteredClient()
@@ -2768,6 +2796,27 @@ class PriorityQueueViewTests(unittest.TestCase):
         self.assertIn("walltime=1d", written)
         self.assertIn("backfill", written)
 
+    def test_priority_detail_uses_corrected_order_for_users_ahead(self):
+        snapshot = make_priority_snapshot(
+            make_priority_job(
+                "100", user="low", account="pi-low", priority=100
+            ),
+            make_priority_job("200", account="pi-test", priority=500),
+            make_priority_job(
+                "300", user="high", account="pi-high", priority=900
+            ),
+        )
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        app.state.priority_queue = snapshot
+        app.state.selected = 1
+        screen = FakeScreen(height=42, width=140)
+
+        app._draw_priority_detail(screen, screen.height, screen.width)
+
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn("users ahead in snapshot: high/pi-high×1", written)
+        self.assertNotIn("users ahead in snapshot: low/pi-low×1", written)
+
     def test_narrow_priority_table_keeps_core_columns(self):
         snapshot = self._snapshot()
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
@@ -2786,7 +2835,8 @@ class PriorityQueueViewTests(unittest.TestCase):
         self.assertTrue(
             {
                 "YOU",
-                "SLOTS",
+                "JOBS",
+                "TASKS",
                 "USER",
                 "PARTITION",
                 "RANK",
@@ -2815,7 +2865,7 @@ class PriorityQueueViewTests(unittest.TestCase):
         self.assertIn("why waiting: Resources", written)
         self.assertIn("use or unavailable", written)
 
-    def test_priority_table_shows_one_array_route_with_a_rank_band(self):
+    def test_priority_table_shows_array_job_and_task_counts_with_a_rank_band(self):
         snapshot = make_priority_snapshot(
             make_priority_job("900", user="alice", priority=900),
             make_priority_job("100_2", priority=700),
@@ -2834,8 +2884,19 @@ class PriorityQueueViewTests(unittest.TestCase):
             screen.width,
         )
 
+        group = app._visible_priority_entries()[1]
+        specs = {
+            label: value_fn
+            for label, _minimum, _maximum, value_fn in responsive_priority_specs(
+                300,
+                current_user=snapshot.user,
+            )
+        }
+        self.assertNotIn("SLOTS", specs)
+        self.assertEqual(specs["JOBS"](group), "1")
+        self.assertEqual(specs["TASKS"](group), "3")
+
         written = " ".join(write[2] for write in screen.writes)
-        self.assertIn("100_[2-4]", written)
         self.assertIn("2-4/4", written)
         self.assertIn("Packed: 2 rank runs / 4 queue entries", written)
 
@@ -2922,6 +2983,15 @@ class PriorityQueueViewTests(unittest.TestCase):
         group = app._visible_priority_entries()[0]
         self.assertEqual(group.display_job_id, "10 jobs")
         self.assertEqual(group.priority_rank_text, "1-10 of 11")
+        specs = {
+            label: value_fn
+            for label, _minimum, _maximum, value_fn in responsive_priority_specs(
+                300,
+                current_user=snapshot.user,
+            )
+        }
+        self.assertEqual(specs["JOBS"](group), "10")
+        self.assertEqual(specs["TASKS"](group), "10")
 
         screen = FakeScreen(height=42, width=140)
         app._draw_priority(screen, screen.height, screen.width)
@@ -2942,6 +3012,56 @@ class PriorityQueueViewTests(unittest.TestCase):
 
         self.assertEqual(app._visible_count(), 11)
         self.assertEqual(app._selected_priority_entry().job.job_id, "900")
+
+    def test_packed_unranked_tasks_use_a_group_without_rank_or_ahead_counts(self):
+        snapshot = make_priority_snapshot(
+            make_priority_job("900", user="alice", priority=900),
+            *[
+                make_priority_job(
+                    f"4877755_{task}",
+                    user="achawla1",
+                    name="decoder-8b-fsdp",
+                    reason="DependencyNeverSatisfied",
+                    priority=2243,
+                )
+                for task in range(3)
+            ],
+        )
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        app.state.priority_queue = snapshot
+        app.state.selected = 1
+        group = app._selected_priority_entry()
+
+        self.assertIsNotNone(group)
+        self.assertEqual(group.display_job_id, "4877755_[0-2]")
+        specs = {
+            label: value_fn
+            for label, _minimum, _maximum, value_fn in responsive_priority_specs(
+                300,
+                current_user=snapshot.user,
+            )
+        }
+        self.assertEqual(specs["AHEAD"](group), "—")
+        self.assertEqual(specs["USERS"](group), "—")
+        self.assertEqual(specs["JOBS"](group), "1")
+        self.assertEqual(specs["TASKS"](group), "3")
+
+        screen = FakeScreen(height=42, width=180)
+        app._draw_priority(screen, screen.height, screen.width)
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn(
+            "Packed: 1 rank run + 1 unranked group / 4 queue entries",
+            written,
+        )
+        self.assertIn("selected unranked group", written)
+        self.assertIn("entries=4877755_[0-2]", written)
+        self.assertIn(
+            "packed same-user unranked group: 1 job / 3 pending entries",
+            written,
+        )
+        self.assertIn("no priority rank or ahead count", written)
+        self.assertIn("requested across 3 entries", written)
+        self.assertNotIn("3 consecutive rank slots", written)
 
     def test_packing_selects_the_exact_split_array_group(self):
         snapshot = make_priority_snapshot(

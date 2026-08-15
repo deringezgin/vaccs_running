@@ -140,6 +140,20 @@ def _priority_scope(job: PriorityQueueJob) -> tuple[str, str]:
     return job.partition, _normalize_reservation(job.reservation)
 
 
+def _natural_job_id_sort_key(job_id: str) -> tuple:
+    """Match Slurm's numeric JobID ordering, including array task IDs."""
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part.casefold())
+        for part in re.split(r"(\d+)", job_id)
+    )
+
+
+def _priority_queue_sort_key(job: PriorityQueueJob) -> tuple:
+    """Documented squeue order: descending PriorityLong, then JobID."""
+    priority = job.priority if job.priority is not None else -1
+    return (-priority, _natural_job_id_sort_key(job.job_id))
+
+
 def _complete_sum(
     entries: list[PriorityQueueEntry],
     attribute: str,
@@ -150,10 +164,12 @@ def _complete_sum(
     return sum(values)
 
 
-def _merge_priority_slot_run(
+def _merge_priority_entries(
     entries: list[PriorityQueueEntry],
+    *,
+    ranked: bool,
 ) -> PriorityQueueEntry:
-    """Combine adjacent raw rank slots owned by one user into one row."""
+    """Combine same-user ranked slots or unranked entries into one row."""
     first = entries[0]
     if len(entries) == 1:
         return first
@@ -198,7 +214,7 @@ def _merge_priority_slot_run(
         )
     )
     last = entries[-1]
-    rank_end = last.rank_end or last.priority_rank
+    rank_end = (last.rank_end or last.priority_rank) if ranked else None
     task_count = sum(entry.task_count for entry in entries)
     job_count = len(group_job_ids)
     source_group_count = sum(entry.source_group_count for entry in entries)
@@ -208,6 +224,23 @@ def _merge_priority_slot_run(
         scope += f", reservation {reservation}"
     walltimes = [entry.walltime_min_seconds for entry in entries]
     complete_walltimes = all(value is not None for value in walltimes)
+    if ranked:
+        rank_note = (
+            f"Priority-rank snapshot among schedulable pending jobs in {scope}; "
+            f"this row covers literal rank slots {first.priority_rank}-{rank_end}, "
+            f"all owned by {first.job.user}, across {job_count} job"
+            f"{'s' if job_count != 1 else ''}. "
+            "Press e to inspect them individually; resource fit, reservations, "
+            "preemption, and backfill can change actual start order."
+        )
+    else:
+        reasons = ", ".join(group_reason_codes)
+        rank_note = (
+            f"No priority rank; this packed row combines {task_count} unranked "
+            f"pending entries owned by {first.job.user} in {scope}. Slurm reports "
+            f"{reasons}; these entries are outside the normal Priority/Resources "
+            "queue. Press e to inspect them individually."
+        )
     return replace(
         first,
         rank_end=rank_end,
@@ -223,14 +256,7 @@ def _merge_priority_slot_run(
         requested_memory_mb=_complete_sum(entries, "requested_memory_mb"),
         walltime_min_seconds=(min(walltimes) if complete_walltimes else None),
         walltime_max_seconds=(max(walltimes) if complete_walltimes else None),
-        rank_note=(
-            f"Priority-rank snapshot among schedulable pending jobs in {scope}; "
-            f"this row covers literal rank slots {first.priority_rank}-{rank_end}, "
-            f"all owned by {first.job.user}, across {job_count} job"
-            f"{'s' if job_count != 1 else ''}. "
-            "Press e to inspect them individually; resource fit, reservations, "
-            "preemption, and backfill can change actual start order."
-        ),
+        rank_note=rank_note,
     )
 
 
@@ -252,11 +278,31 @@ def _pack_priority_rank_runs(
             run.append(entry)
             continue
         if run:
-            packed.append(_merge_priority_slot_run(run))
+            packed.append(_merge_priority_entries(run, ranked=True))
         run = [entry]
     if run:
-        packed.append(_merge_priority_slot_run(run))
+        packed.append(_merge_priority_entries(run, ranked=True))
     return packed
+
+
+def _pack_unranked_user_groups(
+    entries: list[PriorityQueueEntry],
+) -> list[PriorityQueueEntry]:
+    """Pack each owner's unranked entries once without implying rank order."""
+    groups: list[list[PriorityQueueEntry]] = []
+    group_index_by_user: dict[str, int] = {}
+    for entry in entries:
+        user = entry.job.user
+        if user and user in group_index_by_user:
+            groups[group_index_by_user[user]].append(entry)
+            continue
+        if user:
+            group_index_by_user[user] = len(groups)
+        groups.append([entry])
+    return [
+        _merge_priority_entries(group, ranked=False)
+        for group in groups
+    ]
 
 
 def build_priority_queue_snapshot(
@@ -267,12 +313,14 @@ def build_priority_queue_snapshot(
     factors_available: bool = False,
     factors_error: str = "",
 ) -> PriorityQueueSnapshot:
-    """Build cluster-wide packed/raw ranks from scheduler-ordered pending rows.
+    """Build cluster-wide packed/raw ranks from pending scheduler rows.
 
     Ranks deliberately include only ``Priority`` and ``Resources`` rows in the
     same partition/reservation. Holds, dependencies, invalid requests, and
     policy limits can carry a high composite score (especially with
     ``ACCRUE_ALWAYS``) but are not blockers in the normal schedulable queue.
+    Expanded ``squeue --array`` output is sorted again here because some Slurm
+    versions do not keep expanded tasks monotonic by their displayed priority.
     """
     pending_jobs = tuple(attach_priority_factors(jobs, factor_records))
     jobs_by_scope: dict[tuple[str, str], list[PriorityQueueJob]] = {}
@@ -280,7 +328,10 @@ def build_priority_queue_snapshot(
         jobs_by_scope.setdefault(_priority_scope(job), []).append(job)
 
     rankable_by_scope = {
-        scope: [job for job in scoped_jobs if job.is_rankable]
+        scope: sorted(
+            (job for job in scoped_jobs if job.is_rankable),
+            key=_priority_queue_sort_key,
+        )
         for scope, scoped_jobs in jobs_by_scope.items()
     }
 
@@ -351,7 +402,7 @@ def build_priority_queue_snapshot(
     grouped_entries: list[PriorityQueueEntry] = []
     for scope, scoped_jobs in jobs_by_scope.items():
         ranked_entries = [
-            all_entries_by_job[id(job)] for job in scoped_jobs if job.is_rankable
+            all_entries_by_job[id(job)] for job in rankable_by_scope[scope]
         ]
         unranked_entries = [
             unranked_entries_by_job[id(job)]
@@ -361,7 +412,7 @@ def build_priority_queue_snapshot(
         all_entries.extend(ranked_entries)
         all_entries.extend(unranked_entries)
         grouped_entries.extend(_pack_priority_rank_runs(ranked_entries))
-        grouped_entries.extend(unranked_entries)
+        grouped_entries.extend(_pack_unranked_user_groups(unranked_entries))
 
     my_jobs = tuple(
         entry for entry in grouped_entries if entry.job.user == user

@@ -333,6 +333,66 @@ class PriorityQueueTests(unittest.TestCase):
             set(),
         )
 
+    def test_snapshot_resorts_expanded_rows_by_priority_then_numeric_job_id(self):
+        snapshot = build_priority_queue_snapshot(
+            "me",
+            [
+                parse_priority_queue_line(
+                    priority_queue_line("100_10", "me", "nvgpu", "Priority", 501)
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line("100_20", "me", "nvgpu", "Priority", 444)
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line("90_2", "ccoil", "nvgpu", "Priority", 501)
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line("100_2", "me", "nvgpu", "Priority", 501)
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line("100_3", "me", "nvgpu", "Priority", 503)
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line("90_1", "ccoil", "nvgpu", "Priority", 503)
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line("100_1", "me", "nvgpu", "Resources", 517)
+                ),
+            ],
+        )
+
+        self.assertEqual(
+            [
+                (
+                    entry.job.user,
+                    entry.job.job_id,
+                    entry.job.priority,
+                    entry.priority_rank,
+                    entry.earlier_count,
+                )
+                for entry in snapshot.all_entries
+            ],
+            [
+                ("me", "100_1", 517, 1, 0),
+                ("ccoil", "90_1", 503, 2, 1),
+                ("me", "100_3", 503, 3, 2),
+                ("ccoil", "90_2", 501, 4, 3),
+                ("me", "100_2", 501, 5, 4),
+                ("me", "100_10", 501, 6, 5),
+                ("me", "100_20", 444, 7, 6),
+            ],
+        )
+        priorities = [entry.job.priority for entry in snapshot.all_entries]
+        self.assertEqual(priorities, sorted(priorities, reverse=True))
+        self.assertEqual(
+            [entry.job.user for entry in snapshot.grouped_entries],
+            ["me", "ccoil", "me", "ccoil", "me"],
+        )
+        final_run = snapshot.grouped_entries[-1]
+        self.assertEqual(final_run.priority_rank_text, "5-7 of 7")
+        self.assertEqual(final_run.display_job_id, "100_[2,10,20]")
+        self.assertEqual(final_run.display_priority, "501-444")
+
     def test_snapshot_splits_one_array_when_pending_reasons_differ(self):
         snapshot = build_priority_queue_snapshot(
             "me",
@@ -352,6 +412,71 @@ class PriorityQueueTests(unittest.TestCase):
         self.assertEqual(ranked.priority_rank_text, "1 of 1")
         self.assertEqual(dependency.task_job_ids, ("100_2",))
         self.assertIsNone(dependency.priority_rank)
+
+    def test_snapshot_packs_each_users_unranked_entries_without_assigning_ranks(self):
+        snapshot = build_priority_queue_snapshot(
+            "me",
+            [
+                parse_priority_queue_line(
+                    priority_queue_line("900", "alice", "nvgpu", "Priority", 900)
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line(
+                        "4877755_0",
+                        "achawla1",
+                        "nvgpu",
+                        "DependencyNeverSatisfied",
+                        2243,
+                    )
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line(
+                        "800", "bob", "nvgpu", "PartitionTimeLimit", 1200
+                    )
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line(
+                        "4877755_1",
+                        "achawla1",
+                        "nvgpu",
+                        "DependencyNeverSatisfied",
+                        2243,
+                    )
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line(
+                        "4880000",
+                        "achawla1",
+                        "nvgpu",
+                        "Dependency",
+                        2200,
+                    )
+                ),
+            ],
+        )
+
+        self.assertEqual(len(snapshot.all_entries), 5)
+        self.assertEqual(len(snapshot.grouped_entries), 3)
+        ranked, achawla, bob = snapshot.grouped_entries
+        self.assertEqual(ranked.job.user, "alice")
+        self.assertEqual(achawla.job.user, "achawla1")
+        self.assertEqual(achawla.task_count, 3)
+        self.assertEqual(achawla.job_count, 2)
+        self.assertEqual(achawla.display_job_id, "2 jobs / 3 tasks")
+        self.assertEqual(
+            achawla.task_job_ids,
+            ("4877755_0", "4877755_1", "4880000"),
+        )
+        self.assertEqual(
+            achawla.group_reason_codes,
+            ("DependencyNeverSatisfied", "Dependency"),
+        )
+        self.assertEqual(achawla.display_reason, "mixed (2)")
+        self.assertIsNone(achawla.priority_rank)
+        self.assertIsNone(achawla.rank_end)
+        self.assertIn("unranked pending entries", achawla.rank_note)
+        self.assertNotIn("rank slots", achawla.rank_note)
+        self.assertEqual(bob.job.user, "bob")
 
     def test_snapshot_packs_consecutive_ranked_jobs_from_the_same_user(self):
         jobs = [

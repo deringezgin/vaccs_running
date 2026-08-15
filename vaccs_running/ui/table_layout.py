@@ -68,7 +68,8 @@ def responsive_priority_specs(
             3,
             lambda entry: "YOU" if entry.job.user == current_user else "",
         ),
-        ("SLOTS", 10, 24, lambda entry: entry.display_job_id),
+        ("JOBS", 4, 8, lambda entry: str(entry.job_count)),
+        ("TASKS", 5, 8, lambda entry: str(entry.task_count)),
         ("USER", 6, 16, lambda entry: entry.job.user or "-"),
         ("JOB", 10, 28, lambda entry: entry.display_name),
         ("PARTITION", 8, 24, lambda entry: entry.job.queue_label),
@@ -83,12 +84,21 @@ def responsive_priority_specs(
             12,
             lambda entry: entry.display_priority,
         ),
-        ("AHEAD", 5, 7, lambda entry: str(entry.earlier_count)),
+        (
+            "AHEAD",
+            5,
+            7,
+            lambda entry: (
+                "—" if entry.priority_rank is None else str(entry.earlier_count)
+            ),
+        ),
         (
             "USERS",
             5,
             7,
-            lambda entry: str(entry.earlier_user_count),
+            lambda entry: (
+                "—" if entry.priority_rank is None else str(entry.earlier_user_count)
+            ),
         ),
         ("WHY", 16, 38, lambda entry: entry.display_reason),
         ("EST START", 16, 20, lambda entry: entry.display_estimated_start),

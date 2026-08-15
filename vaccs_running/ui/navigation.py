@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import curses
+import re
 
 from .summaries import filter_running_jobs
 from ..slurm import (
@@ -11,6 +12,14 @@ from ..slurm import (
     group_job_records,
     record_from_job,
 )
+
+
+def _job_id_sort_key(job_id: str) -> tuple:
+    """Return a natural ascending key for Slurm job and array-task IDs."""
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part.casefold())
+        for part in re.split(r"(\d+)", job_id)
+    )
 
 
 class NavigationMixin:
@@ -45,14 +54,23 @@ class NavigationMixin:
 
     def _visible_jobs(self) -> list[Job]:
         if self._jobs_filter_active():
-            return self.state.jobs
+            visible = self.state.jobs
+        else:
+            visible = filter_running_jobs(self.state.jobs)
 
-        return filter_running_jobs(self.state.jobs)
+        return sorted(visible, key=lambda job: _job_id_sort_key(job.job_id))
 
     def _visible_job_groups(self) -> list[JobRecordGroup]:
         if self._jobs_filter_active() and not self.state.job_records:
-            return group_job_records(record_from_job(job) for job in self.state.jobs)
-        return group_job_records(self.state.job_records)
+            groups = group_job_records(
+                record_from_job(job) for job in self.state.jobs
+            )
+        else:
+            groups = group_job_records(self.state.job_records)
+        return sorted(
+            groups,
+            key=lambda group: _job_id_sort_key(group.array_parent),
+        )
 
     def _visible_history_groups(self) -> list[JobRecordGroup]:
         return group_job_records(self.state.history)

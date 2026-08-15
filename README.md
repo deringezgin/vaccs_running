@@ -98,25 +98,28 @@ You can also preselect these filters at launch (see [Quick Start](#quick-start))
 <details>
 <summary><strong>Priority</strong> (<code>w</code>)</summary>
 
-Packed mode shows the literal pending priority queue from every user. Within
-each partition/reservation it covers rank slots `1` through `N` exactly once,
-folding only adjacent slots owned by the same user into a run (for example, ten
-consecutive jobs become one `10 jobs` row ranked `2-11/N`). It never groups
-across another user's slot, a partition, or a reservation. Ranked runs are shown
-first; holds, dependencies, and other jobs outside the schedulable
-Priority/Resources queue remain visible as unranked rows afterward. Each row
-shows requested GPUs, CPUs, total RAM, and requested walltime; packed runs sum
-GPU/CPU/RAM across their slots and show a common walltime or its range. Your
-rows are marked `YOU`.
+Packed mode shows the pending priority queue from every user. Within each
+partition/reservation, schedulable `Priority`/`Resources` entries are ordered by
+Slurm's `PriorityLong` value (descending) and Job ID (ascending), then assigned
+rank slots `1` through `N` exactly once. Adjacent slots owned by the same user
+fold into a run (for example, ten consecutive jobs become one `10 jobs` row
+ranked `2-11/N`), but never across another user's slot, a partition, or a
+reservation. Holds, dependencies, and policy-limit entries are outside that
+ranked queue; packed mode groups them separately by owner with `—` for rank and
+ahead counts, while extended mode keeps every entry visible. Each row shows
+the number of distinct jobs/array parents and pending tasks represented by the
+run, followed by requested GPUs, CPUs, total RAM, and requested walltime. Packed
+rows sum GPU/CPU/RAM and show a common walltime or its range. Your rows are
+marked `YOU`.
 
-- `e` — **extend** the view to unpack every pending rank slot from every user.
+- `e` — **extend** the view to unpack every pending queue entry from every user.
   Press `e` (or click **extend**) again to return to the cluster-wide packed
   queue.
 - `g` — show the combined `nvgpu` and `gpu-preempt` queues. Press `g` again to
   return to all partitions; `gpu-debug` remains available through `f`.
 - `f` — **filter** the Priority queue by one or more partitions. Partition is
   the only Priority filter for now; for example, select `nvgpu` to see its full
-  `1` through `N` queue, then use `e` for every individual rank slot.
+  `1` through `N` queue, then use `e` for every individual queue entry.
 
 Priority rank is a snapshot, not a guaranteed start order. A lower-ranked job
 can start first when its CPU, memory, GPU, feature, reservation, or time request
