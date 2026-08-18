@@ -688,8 +688,9 @@ class GpfsQuota:
     """Parsed ``my_gpfs_quota`` output for the info screen.
 
     ``group_space`` and ``group_files`` rows are (filesystem, used, soft quota,
-    hard limit); the personal rows are (filesystem, value). Space values keep
-    their human units (e.g. '17.58T') and file counts remain decimal strings.
+    hard limit); the personal rows are (filesystem, value). Active grace-period
+    countdowns are retained separately by filesystem. Space values keep their
+    human units (e.g. '17.58T') and file counts remain decimal strings.
     """
 
     primary_group: str
@@ -697,3 +698,15 @@ class GpfsQuota:
     group_files: list[tuple[str, str, str, str]] = field(default_factory=list)
     personal_space: list[tuple[str, str]] = field(default_factory=list)
     personal_files: list[tuple[str, str]] = field(default_factory=list)
+    group_space_grace: list[tuple[str, str]] = field(default_factory=list)
+    group_files_grace: list[tuple[str, str]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class GpfsMemberUsage:
+    """One group member's GPFS usage on one filesystem."""
+
+    user: str
+    filesystem: str
+    space: str
+    files: int

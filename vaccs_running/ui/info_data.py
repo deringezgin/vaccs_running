@@ -44,6 +44,8 @@ class InfoDataMixin:
                 "windows": {},
                 "gpfs": None,
                 "gpfs_error": "",
+                "gpfs_group_usage": None,
+                "gpfs_group_usage_error": "",
                 # None per window == still loading.
                 "efficiency": {key: None for key, _w, _l in JOB_EFFICIENCY_WINDOWS},
             }
@@ -84,6 +86,13 @@ class InfoDataMixin:
         except Exception as exc:
             update["gpfs"] = None
             update["gpfs_error"] = str(exc)
+
+        try:
+            update["gpfs_group_usage"] = self.client.fetch_gpfs_group_usage()
+            update["gpfs_group_usage_error"] = ""
+        except Exception as exc:
+            update["gpfs_group_usage"] = None
+            update["gpfs_group_usage_error"] = str(exc)
 
         with self._info_lock:
             if generation == self._info_generation:

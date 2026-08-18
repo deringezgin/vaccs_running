@@ -6,6 +6,7 @@ from ..slurm import (
     format_fairshare,
     human_bytes,
     human_duration,
+    parse_storage_size,
     storage_percent,
 )
 
@@ -109,7 +110,7 @@ def build_user_info_lines(
     blank()
 
     # Storage (GPFS) ----------------------------------------------------
-    rows.extend(_gpfs_lines(snapshot, default, spinner))
+    rows.extend(_gpfs_lines(snapshot, default, spinner, user))
     blank()
 
     # Job efficiency (last; each window streams in as it loads) ---------
@@ -217,6 +218,7 @@ def _gpfs_lines(
     snapshot: dict,
     default: str,
     spinner: str,
+    user: str,
 ) -> list[list[tuple[str, str]]]:
     rows: list[list[tuple[str, str]]] = []
     gpfs = snapshot.get("gpfs")
@@ -232,6 +234,7 @@ def _gpfs_lines(
             rows.append([("  ", "muted"), (f"{spinner} …".strip(), "muted")])
         return rows
 
+    space_grace = dict(gpfs.group_space_grace)
     for filesystem, used, quota, _limit in gpfs.group_space:
         percent = storage_percent(used, quota)
         if percent is None:
@@ -253,7 +256,13 @@ def _gpfs_lines(
                 (percent_text, percent_style),
             ]
         )
+        grace_text, grace_style = _gpfs_grace_status(
+            space_grace.get(filesystem, ""), "storage"
+        )
+        if grace_text:
+            rows.append([(" " * 21, "muted"), (grace_text, grace_style)])
 
+    files_grace = dict(gpfs.group_files_grace)
     for filesystem, used, quota, limit in gpfs.group_files:
         percent, percent_style = _file_quota_percent(used, quota)
         soft_status, soft_style = _file_quota_remaining(used, quota, "soft")
@@ -280,6 +289,11 @@ def _gpfs_lines(
                     (hard_status, hard_style),
                 ]
             )
+        grace_text, grace_style = _gpfs_grace_status(
+            files_grace.get(filesystem, ""), "file"
+        )
+        if grace_text:
+            rows.append([(" " * 21, "muted"), (grace_text, grace_style)])
 
     merged: dict[str, dict[str, str]] = {}
     for filesystem, used in gpfs.personal_space:
@@ -302,6 +316,72 @@ def _gpfs_lines(
                     (f"{files_text:>13} files", "muted"),
                 ]
             )
+    rows.extend(_gpfs_group_top_lines(snapshot, user))
+    return rows
+
+
+def _gpfs_group_top_lines(
+    snapshot: dict,
+    user: str,
+) -> list[list[tuple[str, str]]]:
+    usage = snapshot.get("gpfs_group_usage")
+    rows: list[list[tuple[str, str]]] = [[("", "muted")]]
+    if usage is None:
+        rows.append(
+            [
+                ("  ", "muted"),
+                ("group top 5", "muted"),
+                ("  unavailable", "bad"),
+            ]
+        )
+        return rows
+
+    rows.append([("  ", "muted"), ("group top 5", "muted")])
+    for filesystem in ("gpfs1", "gpfs2"):
+        entries = [entry for entry in usage if entry.filesystem == filesystem]
+        by_space = sorted(
+            entries,
+            key=lambda entry: (-(parse_storage_size(entry.space) or 0), entry.user),
+        )[:5]
+        by_files = sorted(entries, key=lambda entry: (-entry.files, entry.user))[:5]
+        if not by_space and not by_files:
+            continue
+
+        rows.append([("", "muted")])
+        rows.append([("  ", "muted"), (filesystem, "heading")])
+        rows.append(
+            [
+                ("    ", "muted"),
+                (f"{'storage':<22}", "muted"),
+                ("files", "muted"),
+            ]
+        )
+        for index in range(max(len(by_space), len(by_files))):
+            row: list[tuple[str, str]] = [("  ", "muted")]
+            if index < len(by_space):
+                entry = by_space[index]
+                style = "title" if entry.user == user else "muted"
+                row.extend(
+                    [
+                        (f"{index + 1:>2} ", style),
+                        (f"{entry.user:<11}", style),
+                        (f"{entry.space:>8}", style),
+                    ]
+                )
+            else:
+                row.append((" " * 22, "muted"))
+            row.append(("  ", "muted"))
+            if index < len(by_files):
+                entry = by_files[index]
+                style = "title" if entry.user == user else "muted"
+                row.extend(
+                    [
+                        (f"{index + 1:>2} ", style),
+                        (f"{entry.user:<11}", style),
+                        (f"{entry.files:>11,}", style),
+                    ]
+                )
+            rows.append(row)
     return rows
 
 
@@ -310,6 +390,15 @@ def _parse_file_count(value: str) -> int | None:
         return int(value.replace(",", ""))
     except (AttributeError, ValueError):
         return None
+
+
+def _gpfs_grace_status(value: str, quota_type: str) -> tuple[str, str]:
+    value = value.strip()
+    if not value or value.lower() in {"none", "n/a"}:
+        return "", "muted"
+    if value.lower() == "expired":
+        return f"{quota_type} grace expired", "bad"
+    return f"{quota_type} grace: {value} left", "warn"
 
 
 def _format_file_count(value: str) -> str:

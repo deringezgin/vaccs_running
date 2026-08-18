@@ -5,6 +5,7 @@ from unittest import mock
 
 from vaccs_running.slurm import (
     EfficiencySummary,
+    GpfsMemberUsage,
     GpfsQuota,
     Job,
     JobFilterChoices,
@@ -105,6 +106,14 @@ class FakeClient:
             personal_space=[("gpfs1", "500G")],
             personal_files=[("gpfs1", "42")],
         )
+
+    def fetch_gpfs_group_usage(self):
+        return [
+            GpfsMemberUsage("alice", "gpfs1", "900G", 90),
+            GpfsMemberUsage("tester", "gpfs1", "500G", 42),
+            GpfsMemberUsage("alice", "gpfs2", "2T", 200),
+            GpfsMemberUsage("tester", "gpfs2", "1T", 100),
+        ]
 
     def fetch_job_efficiency(self, window=None, window_label=""):
         return EfficiencySummary(
@@ -2353,8 +2362,18 @@ class UserInfoTests(unittest.TestCase):
             ],
             personal_space=[("gpfs1", "6.897T"), ("gpfs2", "32K")],
             personal_files=[("gpfs1", "1523523"), ("gpfs2", "17")],
+            group_space_grace=[("gpfs2", "5 days")],
+            group_files_grace=[("gpfs1", "4 days")],
         ),
         "gpfs_error": "",
+        "gpfs_group_usage": [
+            GpfsMemberUsage("alice", "gpfs1", "8T", 2_000_000),
+            GpfsMemberUsage("dgezgin", "gpfs1", "6.897T", 1_523_523),
+            GpfsMemberUsage("bob", "gpfs1", "500G", 3_000_000),
+            GpfsMemberUsage("dgezgin", "gpfs2", "32K", 17),
+            GpfsMemberUsage("alice", "gpfs2", "2T", 200),
+        ],
+        "gpfs_group_usage_error": "",
     }
 
     def test_fairshare_style_maps_score_to_priority_band(self):
@@ -2408,8 +2427,32 @@ class UserInfoTests(unittest.TestCase):
         self.assertIn("6,087,390 hard left", blob)
         self.assertIn("4,000,000 soft left", blob)
         self.assertIn("12,000,000 hard left", blob)
+        self.assertIn("storage grace: 5 days left", blob)
+        self.assertIn("file grace: 4 days left", blob)
         self.assertIn("your usage", blob)
         self.assertIn("1,523,523 files", blob)
+        # Per-filesystem group rankings follow personal usage. Storage and
+        # file-count orders are independent.
+        self.assertIn("group top 5", blob)
+        self.assertIn("gpfs1", blob)
+        self.assertIn("gpfs2", blob)
+        self.assertIn("3,000,000", blob)
+        self.assertLess(blob.index("your usage"), blob.index("group top 5"))
+
+        rows = build_user_info_lines("dgezgin", self.READY)
+        own_ranking_rows = [
+            row for row in rows if any("dgezgin" in text for text, _style in row)
+        ]
+        self.assertTrue(own_ranking_rows)
+        for row in own_ranking_rows:
+            highlighted = [
+                style
+                for text, style in row
+                if text.strip()
+                and ("dgezgin" in text or "6.897T" in text or "32K" in text)
+            ]
+            self.assertTrue(highlighted)
+            self.assertTrue(all(style == "title" for style in highlighted))
 
     def test_efficiency_rows_are_raw_numbers_with_no_tiers(self):
         # Percentages are shown plainly (no verdict words), and no metric gets a

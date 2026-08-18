@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from .constants import (
     GPU_TRES_NAMES,
     NODE_JOBS_FIELDS,
@@ -27,6 +29,7 @@ from .primitives import (
 )
 from .models import (
     EfficiencySummary,
+    GpfsMemberUsage,
     GpfsQuota,
     Job,
     JobRecord,
@@ -182,6 +185,8 @@ def parse_gpfs_quota(output: str, user: str = "") -> GpfsQuota:
     group_files: list[tuple[str, str, str, str]] = []
     personal_space: list[tuple[str, str]] = []
     personal_files: list[tuple[str, str]] = []
+    group_space_grace: list[tuple[str, str]] = []
+    group_files_grace: list[tuple[str, str]] = []
     section: str | None = None
     for raw in output.splitlines():
         line = raw.strip()
@@ -213,8 +218,10 @@ def parse_gpfs_quota(output: str, user: str = "") -> GpfsQuota:
         tokens = line.split()
         if section == "group_space" and len(tokens) >= 5 and tokens[1].upper() == "GRP":
             group_space.append((tokens[0], tokens[2], tokens[3], tokens[4]))
+            group_space_grace.append((tokens[0], _parse_gpfs_grace(tokens)))
         elif section == "group_files" and len(tokens) >= 5 and tokens[1].upper() == "GRP":
             group_files.append((tokens[0], tokens[2], tokens[3], tokens[4]))
+            group_files_grace.append((tokens[0], _parse_gpfs_grace(tokens)))
         elif section == "personal_space" and len(tokens) >= 2:
             personal_space.append((tokens[0], tokens[1]))
         elif section == "personal_files" and len(tokens) >= 2:
@@ -225,7 +232,67 @@ def parse_gpfs_quota(output: str, user: str = "") -> GpfsQuota:
         group_files=group_files,
         personal_space=personal_space,
         personal_files=personal_files,
+        group_space_grace=group_space_grace,
+        group_files_grace=group_files_grace,
     )
+
+
+def _parse_gpfs_grace(tokens: list[str]) -> str:
+    """Return the GPFS grace field, which may be one or two tokens."""
+    if len(tokens) <= 6:
+        return ""
+    value = tokens[6]
+    if value.lower() in {"none", "expired"} or len(tokens) == 7:
+        return value
+    if value[:1].isdigit():
+        return f"{value} {tokens[7]}"
+    return value
+
+
+def parse_gpfs_group_usage(output: str) -> list[GpfsMemberUsage]:
+    """Parse ``groupquota`` into per-member GPFS usage rows.
+
+    ``groupquota`` is a small setuid wrapper around ``mmlsquota``. When its
+    output is captured by a pipe, its member labels may be flushed after all of
+    the quota tables; in an interactive terminal the labels are interleaved.
+    Collecting the labels and tables independently keeps both forms parseable.
+    """
+    members: list[str] = []
+    tables: list[list[tuple[str, str, int]]] = []
+    current: list[tuple[str, str, int]] = []
+
+    for raw in output.splitlines():
+        line = raw.strip()
+        member_match = re.match(r"^-+Member\s+(.+?)-+$", line)
+        if member_match:
+            members.append(member_match.group(1).strip())
+            continue
+        if line.lower().startswith("filesystem type"):
+            if current:
+                tables.append(current)
+                current = []
+            continue
+
+        tokens = line.split()
+        if len(tokens) < 4 or tokens[1].upper() != "USR" or "|" not in tokens:
+            continue
+        separator = tokens.index("|")
+        if separator + 1 >= len(tokens):
+            continue
+        try:
+            files = int(tokens[separator + 1].replace(",", ""))
+        except ValueError:
+            continue
+        current.append((tokens[0], tokens[2], files))
+
+    if current:
+        tables.append(current)
+
+    usage: list[GpfsMemberUsage] = []
+    for member, table in zip(members, tables):
+        for filesystem, space, files in table:
+            usage.append(GpfsMemberUsage(member, filesystem, space, files))
+    return usage
 
 
 def summarize_job_efficiency(

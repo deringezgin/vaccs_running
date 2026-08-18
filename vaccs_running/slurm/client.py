@@ -36,6 +36,7 @@ from .primitives import (
 from .format import format_node_jobs
 from .models import (
     EfficiencySummary,
+    GpfsMemberUsage,
     GpfsQuota,
     Job,
     JobFilterChoices,
@@ -47,6 +48,7 @@ from .models import (
 )
 from .parsers import (
     parse_gpfs_quota,
+    parse_gpfs_group_usage,
     parse_node_job_line,
     parse_priority_queue_long_line,
     parse_sacct_records,
@@ -630,6 +632,11 @@ class SlurmClient:
         """Group and personal GPFS storage usage from ``my_gpfs_quota``."""
         output = self.runner.run(["my_gpfs_quota"], timeout=30.0)
         return parse_gpfs_quota(output, self.user)
+
+    def fetch_gpfs_group_usage(self) -> list[GpfsMemberUsage]:
+        """Per-member GPFS usage for the user's primary group."""
+        output = self.runner.run(["groupquota"], timeout=30.0)
+        return parse_gpfs_group_usage(output)
 
     def fetch_job_efficiency(
         self,

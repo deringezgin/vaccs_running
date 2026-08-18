@@ -14,6 +14,7 @@ from vaccs_running.slurm import (
     USAGE_TRES,
     USER_INFO_WINDOWS,
     EfficiencySummary,
+    GpfsMemberUsage,
     GpfsQuota,
     JOB_EFFICIENCY_FORMAT,
     LeaderboardRow,
@@ -26,6 +27,7 @@ from vaccs_running.slurm import (
     human_duration,
     parse_duration_seconds,
     parse_gpfs_quota,
+    parse_gpfs_group_usage,
     parse_reqmem_bytes,
     parse_storage_size,
     storage_percent,
@@ -2326,6 +2328,11 @@ class GpfsQuotaTests(unittest.TestCase):
             quota.group_files,
             [("gpfs1", "6495522", "6291456", "12582912")],
         )
+        self.assertEqual(
+            quota.group_space_grace,
+            [("gpfs1", "none"), ("gpfs2", "none"), ("gpfs3tmp", "none")],
+        )
+        self.assertEqual(quota.group_files_grace, [("gpfs1", "4 days")])
         self.assertEqual(quota.personal_space, [("gpfs1", "6.897T"), ("gpfs2", "32K")])
         self.assertEqual(quota.personal_files, [("gpfs1", "1523523"), ("gpfs2", "17")])
 
@@ -2341,6 +2348,41 @@ class GpfsQuotaTests(unittest.TestCase):
 
         self.assertEqual(quota.primary_group, "pi-ncheney")
         self.assertEqual(fake_runner.calls[0][0], ["my_gpfs_quota"])
+
+    def test_parse_gpfs_group_usage_handles_buffered_member_labels(self):
+        output = "\n".join(
+            [
+                "Filesystem type blocks quota limit in_doubt grace | files quota limit",
+                "gpfs1 GRP 3T 20T 25T 0 none | 300 1000 2000 0 none",
+                "Filesystem type blocks quota limit in_doubt grace | files quota limit",
+                "gpfs1 USR 2T 0 0 0 none | 200 0 0 0 none",
+                "gpfs2 USR 20G 0 0 0 none | 20 0 0 0 none",
+                "Filesystem type blocks quota limit in_doubt grace | files quota limit",
+                "gpfs1 USR 1T 0 0 0 none | 100 0 0 0 none",
+                "gpfs2 USR 10G 0 0 0 none | 10 0 0 0 none",
+                "------Breakdown of quotas for the MEMBERS of your group.------.",
+                "------Member alice------",
+                "------Member bob------",
+            ]
+        )
+
+        self.assertEqual(
+            parse_gpfs_group_usage(output),
+            [
+                GpfsMemberUsage("alice", "gpfs1", "2T", 200),
+                GpfsMemberUsage("alice", "gpfs2", "20G", 20),
+                GpfsMemberUsage("bob", "gpfs1", "1T", 100),
+                GpfsMemberUsage("bob", "gpfs2", "10G", 10),
+            ],
+        )
+
+    def test_fetch_gpfs_group_usage_runs_groupquota(self):
+        client = SlurmClient(user="dgezgin")
+        fake_runner = FakeRunner("")
+        client.runner = fake_runner
+
+        self.assertEqual(client.fetch_gpfs_group_usage(), [])
+        self.assertEqual(fake_runner.calls[0], (["groupquota"], 30.0))
 
     def test_parse_storage_size_converts_human_units(self):
         self.assertEqual(parse_storage_size("1T"), 1024.0 ** 4)
