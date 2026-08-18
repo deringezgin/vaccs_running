@@ -1,4 +1,5 @@
 import curses
+import datetime
 import unittest
 from unittest import mock
 
@@ -385,6 +386,7 @@ def make_priority_job(
     requested_tres="cpu=4,mem=16G,node=1,gres/gpu=1",
     limit="1-00:00:00",
     reservation="",
+    submit_time="2026-07-15T08:00:00",
     factors=None,
 ):
     return PriorityQueueJob(
@@ -397,7 +399,7 @@ def make_priority_job(
         priority=priority,
         account=account,
         qos="normal",
-        submit_time="2026-07-15T08:00:00",
+        submit_time=submit_time,
         start_time="N/A",
         reservation=reservation,
         node_count="1",
@@ -2850,6 +2852,8 @@ class PriorityQueueViewTests(unittest.TestCase):
         self.assertNotIn("JOB", headers)
         self.assertNotIn("AHEAD", headers)
         self.assertNotIn("USERS", headers)
+        self.assertNotIn("SUBMITTED ON", headers)
+        self.assertNotIn("WAIT", headers)
         self.assertNotIn("EST START", headers)
         self.assertNotIn("WHY", headers)
 
@@ -2895,6 +2899,7 @@ class PriorityQueueViewTests(unittest.TestCase):
         self.assertNotIn("SLOTS", specs)
         self.assertEqual(specs["JOBS"](group), "1")
         self.assertEqual(specs["TASKS"](group), "3")
+        self.assertEqual(specs["SUBMITTED ON"](group), "2026-07-15T08:00:00")
 
         written = " ".join(write[2] for write in screen.writes)
         self.assertIn("2-4/4", written)
@@ -2932,6 +2937,8 @@ class PriorityQueueViewTests(unittest.TestCase):
         )
         self.assertNotIn("ACCOUNT", headers)
         self.assertNotIn("JOB", headers)
+        self.assertNotIn("SUBMITTED ON", headers)
+        self.assertNotIn("WAIT", headers)
         self.assertNotIn("EST START", headers)
         self.assertNotIn("WHY", headers)
 
@@ -2959,9 +2966,73 @@ class PriorityQueueViewTests(unittest.TestCase):
             ["900_1", "900_2"],
         )
 
+        extended_specs = {
+            label: value_fn
+            for label, _minimum, _maximum, value_fn in responsive_priority_specs(
+                400,
+                extended=True,
+                current_user=snapshot.user,
+            )
+        }
+        self.assertEqual(
+            extended_specs["SUBMITTED ON"](app._visible_priority_entries()[0]),
+            "2026-07-15T08:00:00",
+        )
+
         app._handle_key(None, ord("e"))
         self.assertEqual(app._visible_count(), 3)
         self.assertEqual(app._selected_priority_entry().display_job_id, "900_[1-2]")
+
+    def test_packed_submission_column_shows_the_group_time_range(self):
+        snapshot = make_priority_snapshot(
+            make_priority_job(
+                "900",
+                user="alice",
+                priority=900,
+                submit_time="2026-07-14T08:00:00",
+            ),
+            make_priority_job(
+                "800",
+                user="alice",
+                priority=800,
+                submit_time="2026-07-15T09:30:00",
+            ),
+        )
+        group = snapshot.grouped_entries[0]
+        specs = {
+            label: value_fn
+            for label, _minimum, _maximum, value_fn in responsive_priority_specs(
+                400,
+                current_user=snapshot.user,
+            )
+        }
+
+        self.assertEqual(
+            specs["SUBMITTED ON"](group),
+            "2026-07-14T08:00:00–2026-07-15T09:30:00",
+        )
+        self.assertEqual(
+            group.wait_text(datetime.datetime(2026, 7, 16, 11, 4, 5)),
+            "1d1h34m5s–2d3h4m5s",
+        )
+
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
+        app.state.priority_queue = snapshot
+        screen = FakeScreen(height=40, width=340)
+        app._draw_priority_table(
+            screen,
+            app._visible_priority_entries(),
+            snapshot,
+            screen.height,
+            screen.width,
+        )
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn("SUBMITTED ON", written)
+        self.assertIn("WAIT", written)
+        self.assertIn(
+            "2026-07-14T08:00:00–2026-07-15T09:30:00",
+            written,
+        )
 
     def test_packed_groups_consecutive_same_user_jobs_and_extend_unpacks_them(self):
         snapshot = make_priority_snapshot(
@@ -3021,11 +3092,17 @@ class PriorityQueueViewTests(unittest.TestCase):
                     f"4877755_{task}",
                     user="achawla1",
                     name="decoder-8b-fsdp",
-                    reason="DependencyNeverSatisfied",
+                    reason="Dependency",
                     priority=2243,
                 )
                 for task in range(3)
             ],
+            make_priority_job(
+                "4877756_0",
+                user="achawla1",
+                reason="DependencyNeverSatisfied",
+                priority=2244,
+            ),
         )
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="priority")
         app.state.priority_queue = snapshot
@@ -3062,6 +3139,11 @@ class PriorityQueueViewTests(unittest.TestCase):
         self.assertIn("no priority rank or ahead count", written)
         self.assertIn("requested across 3 entries", written)
         self.assertNotIn("3 consecutive rank slots", written)
+        self.assertNotIn("4877756_0", written)
+        self.assertNotIn(
+            "4877756_0",
+            {job.job_id for job in snapshot.pending_jobs},
+        )
 
     def test_packing_selects_the_exact_split_array_group(self):
         snapshot = make_priority_snapshot(

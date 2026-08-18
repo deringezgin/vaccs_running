@@ -99,18 +99,20 @@ You can also preselect these filters at launch (see [Quick Start](#quick-start))
 <summary><strong>Priority</strong> (<code>w</code>)</summary>
 
 Packed mode shows the pending priority queue from every user. Within each
-partition/reservation, schedulable `Priority`/`Resources` entries are ordered by
-Slurm's `PriorityLong` value (descending) and Job ID (ascending), then assigned
-rank slots `1` through `N` exactly once. Adjacent slots owned by the same user
-fold into a run (for example, ten consecutive jobs become one `10 jobs` row
-ranked `2-11/N`), but never across another user's slot, a partition, or a
-reservation. Holds, dependencies, and policy-limit entries are outside that
-ranked queue; packed mode groups them separately by owner with `—` for rank and
-ahead counts, while extended mode keeps every entry visible. Each row shows
-the number of distinct jobs/array parents and pending tasks represented by the
-run, followed by requested GPUs, CPUs, total RAM, and requested walltime. Packed
-rows sum GPU/CPU/RAM and show a common walltime or its range. Your rows are
-marked `YOU`.
+partition/reservation, `Priority`, `Resources`, and transient `ReqNodeNotAvail`
+entries are ordered by Slurm's `PriorityLong` value (descending) and Job ID
+(ascending), then assigned rank slots `1` through `N` exactly once. Adjacent
+slots owned by the same user fold into a run (for example, ten consecutive jobs
+become one `10 jobs` row ranked `2-11/N`), but never across another user's slot,
+a partition, or a reservation. Holds, unresolved dependencies, and policy-limit
+entries are outside that ranked queue; packed mode groups them separately by
+owner with `—` for rank and ahead counts, while extended mode keeps them visible.
+Jobs reported as `DependencyNeverSatisfied` are omitted because they can never
+enter the runnable queue. Each row shows the number of distinct jobs/array
+parents and pending tasks represented by the run, followed by requested GPUs,
+CPUs, total RAM, requested walltime, submission time, and live wait duration in
+days/hours/minutes/seconds. Packed rows sum GPU/CPU/RAM and show common
+walltime/submission/wait values or their ranges. Your rows are marked `YOU`.
 
 - `e` — **extend** the view to unpack every pending queue entry from every user.
   Press `e` (or click **extend**) again to return to the cluster-wide packed

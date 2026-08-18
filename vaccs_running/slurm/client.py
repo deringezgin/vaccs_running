@@ -220,11 +220,12 @@ class SlurmClient:
         """Cluster-wide pending jobs plus requested resources and user factors.
 
         ``squeue --priority`` supplies the order Slurm considers for scheduling.
-        Only rows whose reason is Priority/Resources receive a rank; jobs held
-        by dependencies, user/admin holds, or policy/configuration limits are
-        kept visible but excluded from the list of blockers. Multifactor
-        details are queried only for this user and cached to avoid repeatedly
-        sending the comparatively expensive sprio RPC to slurmctld.
+        Priority/Resources rows and transient ReqNodeNotAvail rows receive a
+        rank; jobs held by dependencies, user/admin holds, or policy/configuration
+        limits are kept visible but excluded from the list of blockers.
+        DependencyNeverSatisfied rows are omitted. Multifactor details are
+        queried only for this user and cached to avoid repeatedly sending the
+        comparatively expensive sprio RPC to slurmctld.
         """
         output = self.runner.run(
             [

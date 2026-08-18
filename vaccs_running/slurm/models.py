@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import datetime
 import re
 
 from .constants import FAILED_STATES, PRIORITY_RANKABLE_REASONS
@@ -15,6 +16,13 @@ from .primitives import (
     state_base,
 )
 from .format import human_duration, human_mb
+
+
+def _compact_wait(seconds: int) -> str:
+    days, remainder = divmod(max(0, seconds), 24 * 60 * 60)
+    hours, remainder = divmod(remainder, 60 * 60)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{days}d{hours}h{minutes}m{seconds}s"
 
 
 @dataclass(frozen=True)
@@ -165,6 +173,7 @@ class PriorityQueueEntry:
     group_names: tuple[str, ...] = ()
     group_priorities: tuple[int, ...] = ()
     group_reason_codes: tuple[str, ...] = ()
+    group_submit_times: tuple[str, ...] = ()
     source_group_count: int = 1
     ahead_count: int | None = None
     ahead_user_count: int | None = None
@@ -246,6 +255,53 @@ class PriorityQueueEntry:
         if self.is_consecutive_user_group:
             return "mixed"
         return self.job.estimated_start
+
+    @property
+    def display_submitted_on(self) -> str:
+        values = self.group_submit_times or (self.job.submit_time,)
+        known = tuple(
+            value
+            for value in values
+            if value and value.upper() not in {"N/A", "NONE", "UNKNOWN", "(NULL)"}
+        )
+        if not known:
+            return "-"
+        if len(known) != len(values):
+            return "mixed"
+        earliest = min(known)
+        latest = max(known)
+        return earliest if earliest == latest else f"{earliest}–{latest}"
+
+    def wait_text(self, now: datetime.datetime | None = None) -> str:
+        values = self.group_submit_times or (self.job.submit_time,)
+        current = now or datetime.datetime.now()
+        waits: list[int] = []
+        for value in values:
+            try:
+                submitted = datetime.datetime.fromisoformat(value)
+            except (TypeError, ValueError):
+                continue
+            comparison_now = current
+            if submitted.tzinfo is None and comparison_now.tzinfo is not None:
+                comparison_now = comparison_now.replace(tzinfo=None)
+            elif submitted.tzinfo is not None and comparison_now.tzinfo is None:
+                comparison_now = comparison_now.replace(tzinfo=submitted.tzinfo)
+            elif submitted.tzinfo is not None:
+                comparison_now = comparison_now.astimezone(submitted.tzinfo)
+            waits.append(max(0, int((comparison_now - submitted).total_seconds())))
+        if not waits:
+            return "-"
+        if len(waits) != len(values):
+            return "mixed"
+        shortest = min(waits)
+        longest = max(waits)
+        if shortest == longest:
+            return _compact_wait(shortest)
+        return f"{_compact_wait(shortest)}–{_compact_wait(longest)}"
+
+    @property
+    def display_wait(self) -> str:
+        return self.wait_text()
 
     @property
     def display_job_id(self) -> str:

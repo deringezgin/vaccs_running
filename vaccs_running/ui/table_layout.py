@@ -47,10 +47,14 @@ def responsive_priority_specs(
                 lambda entry: entry.display_priority,
             ),
             ("WHY", 16, 38, lambda entry: entry.display_reason),
+            ("SUBMITTED ON", 19, 39, lambda entry: entry.display_submitted_on),
+            ("WAIT", 10, 25, lambda entry: entry.display_wait),
             ("EST START", 16, 20, lambda entry: entry.display_estimated_start),
         ]
         for removable in (
             "EST START",
+            "SUBMITTED ON",
+            "WAIT",
             "JOB",
             "ACCOUNT",
             "PRIORITY",
@@ -101,12 +105,16 @@ def responsive_priority_specs(
             ),
         ),
         ("WHY", 16, 38, lambda entry: entry.display_reason),
+        ("SUBMITTED ON", 19, 39, lambda entry: entry.display_submitted_on),
+        ("WAIT", 10, 25, lambda entry: entry.display_wait),
         ("EST START", 16, 20, lambda entry: entry.display_estimated_start),
     ]
     # At the supported 70-column minimum, identity and rank are more useful
     # than duplicate detail/count columns. Wider screens retain everything.
     for removable in (
         "EST START",
+        "SUBMITTED ON",
+        "WAIT",
         "JOB",
         "USERS",
         "AHEAD",

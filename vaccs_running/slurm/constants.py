@@ -273,8 +273,12 @@ FAILED_STATES = {
 }
 
 
-# These two reasons mean the job has reached normal scheduler consideration;
-# other pending reasons may represent holds, dependencies, invalid requests,
-# limits, or resource-specific queues for which a simple numeric rank would be
-# misleading.
-PRIORITY_RANKABLE_REASONS = {"Priority", "Resources"}
+# These reasons still participate in a useful priority ordering. In particular,
+# ReqNodeNotAvail is transient when nodes are reserved for maintenance, so
+# dropping it can make the entire live queue appear unranked during an outage.
+PRIORITY_RANKABLE_REASONS = {"Priority", "Resources", "ReqNodeNotAvail"}
+
+
+# A dependency that Slurm has already determined can never succeed is not a
+# queue candidate. Keep it out of packed and extended Priority views entirely.
+PRIORITY_QUEUE_EXCLUDED_REASONS = {"DependencyNeverSatisfied"}

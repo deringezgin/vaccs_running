@@ -179,6 +179,44 @@ class PriorityQueueTests(unittest.TestCase):
         self.assertEqual(job.requested_gpu_count, 2)
         self.assertEqual(job.requested_walltime_seconds, 36 * 60 * 60)
 
+    def test_snapshot_ranks_transient_node_unavailability_and_omits_dead_dependencies(self):
+        snapshot = build_priority_queue_snapshot(
+            "me",
+            [
+                parse_priority_queue_line(
+                    priority_queue_line(
+                        "900",
+                        "blocked",
+                        "nvgpu",
+                        "DependencyNeverSatisfied",
+                        999,
+                    )
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line(
+                        "800",
+                        "me",
+                        "nvgpu",
+                        "ReqNodeNotAvail, Reserved for maintenance",
+                        800,
+                    )
+                ),
+                parse_priority_queue_line(
+                    priority_queue_line("700", "alice", "nvgpu", "Resources", 700)
+                ),
+            ],
+        )
+
+        self.assertEqual(
+            [job.job_id for job in snapshot.pending_jobs],
+            ["800", "700"],
+        )
+        self.assertEqual(
+            [entry.priority_rank_text for entry in snapshot.all_entries],
+            ["1 of 2", "2 of 2"],
+        )
+        self.assertEqual(snapshot.my_jobs[0].job.reason_code, "ReqNodeNotAvail")
+
     def test_snapshot_ranks_only_schedulable_jobs_in_same_partition(self):
         jobs = [
             parse_priority_queue_line(
@@ -425,7 +463,7 @@ class PriorityQueueTests(unittest.TestCase):
                         "4877755_0",
                         "achawla1",
                         "nvgpu",
-                        "DependencyNeverSatisfied",
+                        "Dependency",
                         2243,
                     )
                 ),
@@ -439,7 +477,7 @@ class PriorityQueueTests(unittest.TestCase):
                         "4877755_1",
                         "achawla1",
                         "nvgpu",
-                        "DependencyNeverSatisfied",
+                        "Dependency",
                         2243,
                     )
                 ),
@@ -448,35 +486,40 @@ class PriorityQueueTests(unittest.TestCase):
                         "4880000",
                         "achawla1",
                         "nvgpu",
-                        "Dependency",
+                        "DependencyNeverSatisfied",
                         2200,
                     )
                 ),
             ],
         )
 
-        self.assertEqual(len(snapshot.all_entries), 5)
+        self.assertEqual(len(snapshot.pending_jobs), 4)
+        self.assertEqual(len(snapshot.all_entries), 4)
         self.assertEqual(len(snapshot.grouped_entries), 3)
         ranked, achawla, bob = snapshot.grouped_entries
         self.assertEqual(ranked.job.user, "alice")
         self.assertEqual(achawla.job.user, "achawla1")
-        self.assertEqual(achawla.task_count, 3)
-        self.assertEqual(achawla.job_count, 2)
-        self.assertEqual(achawla.display_job_id, "2 jobs / 3 tasks")
+        self.assertEqual(achawla.task_count, 2)
+        self.assertEqual(achawla.job_count, 1)
+        self.assertEqual(achawla.display_job_id, "4877755_[0-1]")
         self.assertEqual(
             achawla.task_job_ids,
-            ("4877755_0", "4877755_1", "4880000"),
+            ("4877755_0", "4877755_1"),
         )
         self.assertEqual(
             achawla.group_reason_codes,
-            ("DependencyNeverSatisfied", "Dependency"),
+            ("Dependency",),
         )
-        self.assertEqual(achawla.display_reason, "mixed (2)")
+        self.assertEqual(achawla.display_reason, "Dependency")
         self.assertIsNone(achawla.priority_rank)
         self.assertIsNone(achawla.rank_end)
         self.assertIn("unranked pending entries", achawla.rank_note)
         self.assertNotIn("rank slots", achawla.rank_note)
         self.assertEqual(bob.job.user, "bob")
+        self.assertNotIn(
+            "4880000",
+            {job.job_id for job in snapshot.pending_jobs},
+        )
 
     def test_snapshot_packs_consecutive_ranked_jobs_from_the_same_user(self):
         jobs = [

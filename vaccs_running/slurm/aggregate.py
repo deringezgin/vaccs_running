@@ -7,6 +7,7 @@ from typing import Iterable
 from .constants import (
     FAILED_STATES,
     HISTORY_WINDOWS,
+    PRIORITY_QUEUE_EXCLUDED_REASONS,
     ROOT_ACCOUNT,
 )
 from .primitives import (
@@ -213,6 +214,15 @@ def _merge_priority_entries(
             )
         )
     )
+    group_submit_times = tuple(
+        dict.fromkeys(
+            submit_time
+            for entry in entries
+            for submit_time in (
+                entry.group_submit_times or (entry.job.submit_time,)
+            )
+        )
+    )
     last = entries[-1]
     rank_end = (last.rank_end or last.priority_rank) if ranked else None
     task_count = sum(entry.task_count for entry in entries)
@@ -226,7 +236,7 @@ def _merge_priority_entries(
     complete_walltimes = all(value is not None for value in walltimes)
     if ranked:
         rank_note = (
-            f"Priority-rank snapshot among schedulable pending jobs in {scope}; "
+            f"Priority-rank snapshot among ranked pending jobs in {scope}; "
             f"this row covers literal rank slots {first.priority_rank}-{rank_end}, "
             f"all owned by {first.job.user}, across {job_count} job"
             f"{'s' if job_count != 1 else ''}. "
@@ -250,6 +260,7 @@ def _merge_priority_entries(
         group_names=group_names,
         group_priorities=group_priorities,
         group_reason_codes=group_reason_codes,
+        group_submit_times=group_submit_times,
         source_group_count=source_group_count,
         requested_gpus=_complete_sum(entries, "requested_gpus"),
         requested_cpus=_complete_sum(entries, "requested_cpus"),
@@ -315,14 +326,20 @@ def build_priority_queue_snapshot(
 ) -> PriorityQueueSnapshot:
     """Build cluster-wide packed/raw ranks from pending scheduler rows.
 
-    Ranks deliberately include only ``Priority`` and ``Resources`` rows in the
-    same partition/reservation. Holds, dependencies, invalid requests, and
-    policy limits can carry a high composite score (especially with
-    ``ACCRUE_ALWAYS``) but are not blockers in the normal schedulable queue.
+    Ranks include ``Priority``, ``Resources``, and transient
+    ``ReqNodeNotAvail`` rows in the same partition/reservation. Holds,
+    dependencies, invalid requests, and policy limits can carry a high
+    composite score (especially with ``ACCRUE_ALWAYS``) but are not blockers in
+    that ranked queue. ``DependencyNeverSatisfied`` rows are omitted entirely.
     Expanded ``squeue --array`` output is sorted again here because some Slurm
     versions do not keep expanded tasks monotonic by their displayed priority.
     """
-    pending_jobs = tuple(attach_priority_factors(jobs, factor_records))
+    queue_jobs = (
+        job
+        for job in jobs
+        if job.reason_code not in PRIORITY_QUEUE_EXCLUDED_REASONS
+    )
+    pending_jobs = tuple(attach_priority_factors(queue_jobs, factor_records))
     jobs_by_scope: dict[tuple[str, str], list[PriorityQueueJob]] = {}
     for job in pending_jobs:
         jobs_by_scope.setdefault(_priority_scope(job), []).append(job)
@@ -362,7 +379,7 @@ def build_priority_queue_snapshot(
                 walltime_min_seconds=job.requested_walltime_seconds,
                 walltime_max_seconds=job.requested_walltime_seconds,
                 rank_note=(
-                    f"Priority-rank snapshot among schedulable pending jobs in {scope}; "
+                    f"Priority-rank snapshot among ranked pending jobs in {scope}; "
                     "resource fit, reservations, preemption, and backfill can change "
                     "actual start order."
                 ),
@@ -391,7 +408,7 @@ def build_priority_queue_snapshot(
                 walltime_max_seconds=job.requested_walltime_seconds,
                 rank_note=(
                     f"No priority rank while Slurm reports {job.reason_code}; "
-                    "this job is not in the normal Priority/Resources queue."
+                    "this job is not in the ranked priority queue."
                 ),
             )
 
