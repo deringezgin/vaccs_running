@@ -162,13 +162,14 @@ NODE_JOBS_FIELDS = [
     "user",
     "state",
     "elapsed",
+    "limit",
     "cpus",
     "gres",
     "name",
 ]
 
 
-NODE_JOBS_FORMAT = "%i|%u|%T|%M|%C|%b|%j"
+NODE_JOBS_FORMAT = "%i|%u|%T|%M|%l|%C|%b|%j"
 
 
 DEFAULT_SQUEUE_STATES = "all"

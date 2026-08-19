@@ -1594,7 +1594,7 @@ NodeName=gpudebug01 Arch=x86_64 CoresPerSocket=64
     def test_node_jobs_queries_selected_node(self):
         client = SlurmClient(user="testuser")
         fake_runner = FakeRunner(
-            "4341591_1|testuser|RUNNING|12:34|4|gpu:h200:1|train\n"
+            "4341591_1|testuser|RUNNING|12:34|4:00:00|4|gpu:h200:1|train\n"
         )
         client.runner = fake_runner
 
@@ -1606,6 +1606,8 @@ NodeName=gpudebug01 Arch=x86_64 CoresPerSocket=64
         )
         self.assertIn("JOBID", output)
         self.assertIn("USER", output)
+        self.assertIn("LIMIT", output)
+        self.assertIn("4:00:00", output)
         self.assertIn("testuser", output)
         self.assertIn("train", output)
 
@@ -1680,25 +1682,31 @@ other| pi-other|0.125000|0.500000
 
     def test_parse_node_job_line_strips_fields(self):
         job = parse_node_job_line(
-            " 4341679_19 | testuser | RUNNING | 44:18 | 4 | N/A | lcb-ant-omni-lr "
+            " 4341679_19 | testuser | RUNNING | 44:18 | 2:00:00 | 4 | N/A | lcb-ant-omni-lr "
         )
 
         self.assertEqual(job["job_id"], "4341679_19")
         self.assertEqual(job["user"], "testuser")
         self.assertEqual(job["state"], "RUNNING")
+        self.assertEqual(job["limit"], "2:00:00")
         self.assertEqual(job["name"], "lcb-ant-omni-lr")
 
     def test_format_node_jobs_aligns_rows(self):
         text = format_node_jobs(
             [
-                parse_node_job_line("4341591_66|testuser|RUNNING|58:18|4|N/A|lcb-ant-lr"),
-                parse_node_job_line("4341679_19|testuser|RUNNING|44:18|4|N/A|lcb-ant-omni-lr"),
+                parse_node_job_line(
+                    "4341591_66|testuser|RUNNING|58:18|2:00:00|4|N/A|lcb-ant-lr"
+                ),
+                parse_node_job_line(
+                    "4341679_19|testuser|RUNNING|44:18|4:00:00|4|N/A|lcb-ant-omni-lr"
+                ),
             ]
         )
         lines = text.splitlines()
 
         self.assertEqual(lines[0].index("USER"), lines[2].index("testuser"))
         self.assertEqual(lines[0].index("STATE"), lines[2].index("RUNNING"))
+        self.assertEqual(lines[0].index("LIMIT"), lines[2].index("2:00:00"))
         self.assertEqual(lines[0].rindex("JOB"), lines[2].index("lcb-ant-lr"))
 
     def test_parse_gpu_count_handles_slurm_gres_shapes(self):

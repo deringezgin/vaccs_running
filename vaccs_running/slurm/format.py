@@ -61,6 +61,7 @@ def format_node_jobs(jobs: list[dict[str, str]]) -> str:
         ("user", "USER", 10),
         ("state", "STATE", 8),
         ("elapsed", "ELAPSED", 8),
+        ("limit", "LIMIT", 8),
         ("cpus", "CPUS", 4),
         ("gres", "GRES", 12),
         ("name", "JOB", 18),
