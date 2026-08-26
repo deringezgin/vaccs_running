@@ -116,6 +116,7 @@ class PopupMixin:
         height, width = stdscr.getmaxyx()
         top, left, box_height, box_width = popup_geometry(height, width, title, current_text)
         win = curses.newwin(box_height, box_width, top, left)
+        self._apply_theme_background(win)
         win.nodelay(True)
         win.keypad(True)
         scroll = 0

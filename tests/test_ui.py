@@ -285,6 +285,8 @@ class FakeScreen:
         self.height = height
         self.width = width
         self.writes = []
+        self.backgrounds = []
+        self.vlines = []
         self.erase_count = 0
         self.refresh_count = 0
 
@@ -293,6 +295,12 @@ class FakeScreen:
 
     def addstr(self, y, x, text, attr=0):
         self.writes.append((y, x, text, attr))
+
+    def bkgd(self, char, attr=0):
+        self.backgrounds.append((char, attr))
+
+    def vline(self, y, x, char, length, attr=0):
+        self.vlines.append((y, x, char, length, attr))
 
     def erase(self):
         self.erase_count += 1
@@ -602,32 +610,69 @@ class NodeFilterTests(unittest.TestCase):
         other_attr = next(w[3] for w in screen.writes if w[2] == "7d")
         self.assertNotEqual(active_attr, other_attr)
 
-    def test_accent_color_uses_requested_dc582a(self):
+    def test_color_theme_uses_fixed_256_color_palette(self):
         import vaccs_running.ui as ui
 
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
         calls = []
-        missing = object()
-        original_colors = getattr(ui.curses, "COLORS", missing)
-        original_can_change = ui.curses.can_change_color
-        original_init_color = ui.curses.init_color
-        try:
-            ui.curses.COLORS = 256
-            ui.curses.can_change_color = lambda: True
-            ui.curses.init_color = lambda slot, red, green, blue: calls.append(
-                (slot, red, green, blue)
-            )
+        with (
+            mock.patch.object(ui.curses, "COLORS", 256, create=True),
+            mock.patch.object(ui.curses, "has_colors", return_value=True),
+            mock.patch.object(ui.curses, "start_color"),
+            mock.patch.object(
+                ui.curses,
+                "init_pair",
+                side_effect=lambda pair, foreground, background: calls.append(
+                    (pair, foreground, background)
+                ),
+            ),
+            mock.patch.object(ui.curses, "init_color") as init_color,
+            mock.patch.object(ui.curses, "use_default_colors") as default_colors,
+        ):
+            app._init_colors()
 
-            self.assertEqual(app._orange_color(), 16)
-        finally:
-            if original_colors is missing:
-                delattr(ui.curses, "COLORS")
-            else:
-                ui.curses.COLORS = original_colors
-            ui.curses.can_change_color = original_can_change
-            ui.curses.init_color = original_init_color
+        self.assertTrue(app.colors_enabled)
+        self.assertIn((1, 77, 16), calls)
+        self.assertIn((5, 173, 16), calls)
+        self.assertIn((7, 16, 173), calls)
+        self.assertIn((ui.SURFACE_PAIR, 255, 16), calls)
+        init_color.assert_not_called()
+        default_colors.assert_not_called()
 
-        self.assertEqual(calls, [(16, 863, 345, 165)])
+    def test_color_theme_has_explicit_black_16_color_fallback(self):
+        import vaccs_running.ui as ui
+
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        calls = []
+        with (
+            mock.patch.object(ui.curses, "COLORS", 16, create=True),
+            mock.patch.object(ui.curses, "has_colors", return_value=True),
+            mock.patch.object(ui.curses, "start_color"),
+            mock.patch.object(
+                ui.curses,
+                "init_pair",
+                side_effect=lambda pair, foreground, background: calls.append(
+                    (pair, foreground, background)
+                ),
+            ),
+        ):
+            app._init_colors()
+
+        self.assertTrue(app.colors_enabled)
+        self.assertIn((1, curses.COLOR_GREEN, curses.COLOR_BLACK), calls)
+        self.assertIn((5, curses.COLOR_YELLOW, curses.COLOR_BLACK), calls)
+        self.assertIn(
+            (ui.SURFACE_PAIR, curses.COLOR_WHITE, curses.COLOR_BLACK),
+            calls,
+        )
+
+    def test_theme_background_applies_surface_pair_to_window(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        screen = FakeScreen()
+        with mock.patch.object(app, "_pair", return_value=1234):
+            app._apply_theme_background(screen)
+
+        self.assertEqual(screen.backgrounds, [(" ", 1234)])
 
     def test_terminal_too_small_uses_minimum_size(self):
         self.assertTrue(terminal_too_small(69, 32))
@@ -677,6 +722,21 @@ class NodeFilterTests(unittest.TestCase):
         app._draw_box(screen, 2, 0, 4, screen.width, " selected job ")
 
         self.assertIn((5, 19, "╯", curses.A_DIM), screen.writes)
+
+    def test_box_uses_native_vertical_lines_for_connected_side_borders(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        screen = FakeScreen(height=6, width=20)
+
+        app._draw_box(screen, 2, 0, 4, screen.width, " selected job ")
+
+        vertical = getattr(curses, "ACS_VLINE", "│")
+        self.assertEqual(
+            screen.vlines,
+            [
+                (3, 0, vertical, 2, curses.A_DIM),
+                (3, 19, vertical, 2, curses.A_DIM),
+            ],
+        )
 
     def test_jobs_table_title_includes_visible_running_job_status(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)

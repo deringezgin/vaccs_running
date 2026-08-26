@@ -167,6 +167,7 @@ class VaccsRunningApp(
         stdscr.nodelay(True)
         stdscr.keypad(True)
         self._init_colors()
+        self._apply_theme_background(stdscr)
         safe_mousemask()
         self._refresh_current()
 

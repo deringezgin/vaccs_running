@@ -138,6 +138,7 @@ class JobFilterMenuMixin:
         top = max(1, (height - box_height) // 2)
         left = max(1, (width - box_width) // 2)
         win = curses.newwin(box_height, box_width, top, left)
+        self._apply_theme_background(win)
         win.keypad(True)
         win.nodelay(False)
         safe_mousemask()

@@ -62,8 +62,14 @@ class CursesMixin:
         for x in range(left + 1, right):
             self._addstr(win, top, x, "─", attr)
             self._addstr(win, bottom, x, "─", attr)
-        for y in range(top + 1, bottom):
-            self._addstr(win, y, left, "│", attr)
-            self._addstr(win, y, right, "│", attr)
+        vertical_length = bottom - top - 1
+        vertical = getattr(curses, "ACS_VLINE", "│")
+        try:
+            win.vline(top + 1, left, vertical, vertical_length, attr)
+            win.vline(top + 1, right, vertical, vertical_length, attr)
+        except (AttributeError, curses.error):
+            for y in range(top + 1, bottom):
+                self._addstr(win, y, left, "│", attr)
+                self._addstr(win, y, right, "│", attr)
         if title:
             self._addstr(win, top, left + 2, title[: max(0, width - 4)], self._pair(5) | curses.A_BOLD)
