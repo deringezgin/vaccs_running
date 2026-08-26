@@ -2020,7 +2020,7 @@ class LeaderboardTests(unittest.TestCase):
         self.assertIn("GROUP", written)
         self.assertIn("pi-x", written)
         # Fairshare and compact hour counts are rendered.
-        self.assertIn("0.42", written)
+        self.assertIn("0.42000", written)
         self.assertIn("700", written)
 
     def test_usage_leaves_a_blank_row_between_the_menu_and_the_panes(self):
@@ -2049,7 +2049,7 @@ class LeaderboardTests(unittest.TestCase):
         self.assertIn("GROUP", written)
         self.assertIn("pi-x", written)
         self.assertIn("LevelFS", written)
-        self.assertIn("0.125", written)
+        self.assertIn("0.12500", written)
         self.assertNotIn("root", written)
 
     def test_draw_leaderboard_shows_loading_and_error_panes(self):

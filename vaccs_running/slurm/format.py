@@ -104,4 +104,4 @@ def format_fairshare(value: float | None) -> str:
         return "-"
     if value == float("inf"):
         return "∞"
-    return f"{value:.5f}".rstrip("0").rstrip(".")
+    return f"{value:.5f}"

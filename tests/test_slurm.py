@@ -1670,12 +1670,12 @@ other| pi-other|0.125000|0.500000
         self.assertIn("2 people running 2 tasks", output)
         self.assertIn("FS", output)
         self.assertIn("testuser", output)
-        self.assertRegex(output, r"(?m)^testuser\s+1\s+4\s+1\s+16G\s+0\.6806$")
+        self.assertRegex(output, r"(?m)^testuser\s+1\s+4\s+1\s+16G\s+0\.68060$")
         self.assertIn("other", output)
         stripped_output = "\n".join(line.rstrip() for line in output.splitlines())
         self.assertRegex(
             stripped_output,
-            r"(?m)^other\s+1\s+8\s+0\s+32G\s+0\.125$",
+            r"(?m)^other\s+1\s+8\s+0\s+32G\s+0\.12500$",
         )
         self.assertIn("TOTAL", output)
         self.assertRegex(stripped_output, r"(?m)^FREE\s+-\s+-\s+3\s+-\s+-$")
@@ -2122,9 +2122,10 @@ class LeaderboardParsingTests(unittest.TestCase):
     def test_format_fairshare_renders_dash_for_missing(self):
         self.assertEqual(format_fairshare(None), "-")
         self.assertEqual(format_fairshare(float("inf")), "∞")
-        self.assertEqual(format_fairshare(0.6806), "0.6806")
+        self.assertEqual(format_fairshare(0.6806), "0.68060")
         self.assertEqual(format_fairshare(0.000736), "0.00074")
-        self.assertEqual(format_fairshare(0.5), "0.5")
+        self.assertEqual(format_fairshare(0.5), "0.50000")
+        self.assertEqual(format_fairshare(1.0), "1.00000")
 
     def test_usage_window_start_subtracts_window_from_now(self):
         now = datetime.datetime(2026, 7, 12, 9, 0, 0)
