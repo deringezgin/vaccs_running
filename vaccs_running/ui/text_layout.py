@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import textwrap
+from collections.abc import Sequence
 
 
 def filter_choice_options(options: list[str], query: str) -> list[str]:
@@ -32,6 +33,48 @@ def wrap_detail_lines(lines: list[str], width: int) -> list[str]:
             )
             or [""]
         )
+    return wrapped
+
+
+def wrap_detail_blocks(
+    rows: Sequence[Sequence[str]],
+    width: int,
+) -> list[str]:
+    """Wrap detail rows without splitting fields that fit on their own."""
+    available = max(1, width)
+    wrapped: list[str] = []
+    for blocks in rows:
+        current = ""
+        continuation = False
+        for block in blocks:
+            separator = "  " if current else ("  " if continuation else "")
+            candidate = f"{current}{separator}{block}"
+            if len(candidate) <= available:
+                current = candidate
+                continue
+
+            if current:
+                wrapped.append(current)
+                current = ""
+                continuation = True
+
+            prefix = "  " if continuation else ""
+            if len(prefix) + len(block) <= available:
+                current = f"{prefix}{block}"
+                continue
+
+            pieces = textwrap.wrap(
+                block,
+                width=max(1, available - len(prefix)),
+                break_long_words=True,
+                break_on_hyphens=False,
+            ) or [""]
+            wrapped.extend(f"{prefix}{piece}" for piece in pieces[:-1])
+            current = f"{prefix}{pieces[-1]}"
+            continuation = True
+
+        if current:
+            wrapped.append(current)
     return wrapped
 
 

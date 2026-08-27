@@ -396,6 +396,36 @@ class Job:
         return self.state.upper() == "RUNNING"
 
     @property
+    def is_pending(self) -> bool:
+        return self.state.upper() == "PENDING"
+
+    @property
+    def waited_for(self) -> str:
+        try:
+            submitted = datetime.datetime.fromisoformat(self.submit_time)
+            started = datetime.datetime.fromisoformat(self.start_time)
+            waited_seconds = (started - submitted).total_seconds()
+        except (TypeError, ValueError):
+            return "-"
+        return human_duration(max(0, waited_seconds))
+
+    def waiting_for_text(self, now: datetime.datetime | None = None) -> str:
+        try:
+            submitted = datetime.datetime.fromisoformat(self.submit_time)
+        except (TypeError, ValueError):
+            return "-"
+        current = now or datetime.datetime.now(tz=submitted.tzinfo)
+        if submitted.tzinfo is None and current.tzinfo is not None:
+            current = current.replace(tzinfo=None)
+        elif submitted.tzinfo is not None and current.tzinfo is None:
+            current = current.replace(tzinfo=submitted.tzinfo)
+        return human_duration(max(0, (current - submitted).total_seconds()))
+
+    @property
+    def waiting_for(self) -> str:
+        return self.waiting_for_text()
+
+    @property
     def location(self) -> str:
         if self.nodes and self.nodes not in {"(null)", "N/A"}:
             return self.nodes

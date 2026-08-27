@@ -97,9 +97,14 @@ class NavigationMixin:
         return len(self._visible_jobs())
 
     def _page_size(self, stdscr: curses.window) -> int:
-        height, _ = stdscr.getmaxyx()
+        height, width = stdscr.getmaxyx()
         table_top = 5
-        detail_height = min(8, max(4, height // 4))
+        if self.state.view == "jobs" and not self.state.jobs_grouped:
+            detail_height = self._job_detail_height(height, width)
+        elif self.state.view == "nodes":
+            detail_height = self._node_detail_height(height, width)
+        else:
+            detail_height = min(8, max(4, height // 4))
         table_height = max(4, height - detail_height - table_top)
         return max(1, table_height - 3)
 

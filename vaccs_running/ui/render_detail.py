@@ -6,12 +6,50 @@ from .widgets import (
     meter,
     pct,
 )
-from .text_layout import wrap_detail_lines
+from .text_layout import wrap_detail_blocks, wrap_detail_lines
 
 
 class RenderDetailMixin:
+    def _job_detail_lines(self, width: int) -> list[str]:
+        job = self._selected_job()
+        if not job:
+            return ["No jobs found."]
+
+        wait_label = "waiting-for" if job.is_pending else "waited-for"
+        wait_value = job.waiting_for if job.is_pending else job.waited_for
+        timing = [
+            f"submitted={job.submit_time}",
+            f"started={job.start_time}",
+            f"{wait_label}={wait_value}",
+        ]
+        if not job.is_running:
+            timing.append(f"reason={job.reason}")
+
+        rows = [
+            [
+                job.name,
+                f"job={job.job_id}",
+                f"array-parent={job.array_parent}",
+                f"state={job.state}",
+                f"partition={job.partition}",
+                f"nodes={job.nodes or '-'}",
+            ],
+            timing,
+            [
+                f"resources: nodes={job.node_count}",
+                f"cpus={job.cpus}",
+                f"gres={job.gres}",
+            ],
+        ]
+        return wrap_detail_blocks(rows, max(1, width - 4))
+
+    def _job_detail_height(self, height: int, width: int) -> int:
+        desired = len(self._job_detail_lines(width)) + 2
+        max_height = max(3, height - 5 - 4)
+        return min(max_height, max(3, desired))
+
     def _draw_job_detail(self, stdscr: curses.window, height: int, width: int) -> None:
-        panel_height = min(8, max(4, height // 4))
+        panel_height = self._job_detail_height(height, width)
         top = max(4, height - panel_height)
         job = self._selected_job()
         self._draw_box(stdscr, top, 0, panel_height, width, " selected job ")
@@ -19,15 +57,8 @@ class RenderDetailMixin:
             self._addstr(stdscr, top + 1, 2, "No jobs found.", self._pair(2))
             return
 
-        lines = [
-            f"{job.name}  job={job.job_id}  array-parent={job.array_parent}",
-            f"state={job.state}  partition={job.partition}  nodes={job.nodes or '-'}",
-            f"submitted={job.submit_time}  started={job.start_time}  reason={job.reason}",
-            f"resources: nodes={job.node_count}  cpus={job.cpus}  gres={job.gres}",
-        ]
         body_rows = max(0, min(height - 1, top + panel_height - 1) - top - 1)
-        wrapped = wrap_detail_lines(lines, max(1, width - 4))
-        for offset, line in enumerate(wrapped[:body_rows]):
+        for offset, line in enumerate(self._job_detail_lines(width)[:body_rows]):
             self._addstr(
                 stdscr,
                 top + 1 + offset,
@@ -109,14 +140,10 @@ class RenderDetailMixin:
                 self._state_attr(group.dominant_state),
             )
 
-    def _draw_node_detail(self, stdscr: curses.window, height: int, width: int) -> None:
-        panel_height = min(8, max(4, height // 4))
-        top = max(4, height - panel_height)
+    def _node_detail_lines(self, width: int) -> list[str]:
         node = self._selected_node()
-        self._draw_box(stdscr, top, 0, panel_height, width, " selected node ")
         if not node:
-            self._addstr(stdscr, top + 1, 2, "No nodes found.", self._pair(2))
-            return
+            return ["No nodes found."]
 
         gpu_percent = pct(node.gpu_alloc, node.gpu_total)
         lines = [
@@ -132,9 +159,24 @@ class RenderDetailMixin:
             f"gpu alloc={node.gpu_text} free={node.gpu_free}  {meter(gpu_percent, 18)}  tres={node.alloc_tres or '-'}",
             f"features={node.features}",
         ]
+        return wrap_detail_lines(lines, max(1, width - 4))
+
+    def _node_detail_height(self, height: int, width: int) -> int:
+        desired = len(self._node_detail_lines(width)) + 2
+        max_height = max(3, height - 5 - 4)
+        return min(max_height, max(3, desired))
+
+    def _draw_node_detail(self, stdscr: curses.window, height: int, width: int) -> None:
+        panel_height = self._node_detail_height(height, width)
+        top = max(4, height - panel_height)
+        node = self._selected_node()
+        self._draw_box(stdscr, top, 0, panel_height, width, " selected node ")
+        if not node:
+            self._addstr(stdscr, top + 1, 2, "No nodes found.", self._pair(2))
+            return
+
         body_rows = max(0, min(height - 1, top + panel_height - 1) - top - 1)
-        wrapped = wrap_detail_lines(lines, max(1, width - 4))
-        for offset, line in enumerate(wrapped[:body_rows]):
+        for offset, line in enumerate(self._node_detail_lines(width)[:body_rows]):
             self._addstr(
                 stdscr,
                 top + 1 + offset,

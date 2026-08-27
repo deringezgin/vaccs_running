@@ -44,6 +44,7 @@ from vaccs_running.ui import (
     resource_text_width,
     status_title,
     terminal_too_small,
+    wrap_detail_blocks,
     wrap_detail_lines,
 )
 
@@ -371,6 +372,9 @@ def make_job(
     user="",
     group="",
     partition="nvgpu",
+    reason="",
+    submit_time="",
+    start_time="",
 ):
     return Job(
         job_id=job_id,
@@ -378,14 +382,14 @@ def make_job(
         state=state,
         partition=partition,
         nodes="h2node01",
-        reason="",
+        reason=reason,
         elapsed=elapsed,
         limit=limit,
         node_count="1",
         cpus="1",
         gres="",
-        submit_time="",
-        start_time="",
+        submit_time=submit_time,
+        start_time=start_time,
         user=user,
         group=group,
     )
@@ -714,6 +718,104 @@ class NodeFilterTests(unittest.TestCase):
             wrapped,
             ["submitted=2026-05-31T10:04:06", "  started=2026-05-31T11:00:00"],
         )
+
+    def test_detail_blocks_wrap_only_between_fields(self):
+        wrapped = wrap_detail_blocks(
+            [["job=4990535_12", "array-parent=4990535", "state=RUNNING"]],
+            width=39,
+        )
+
+        self.assertEqual(
+            wrapped,
+            ["job=4990535_12  array-parent=4990535", "  state=RUNNING"],
+        )
+
+    def test_running_job_detail_packs_fields_and_uses_content_height(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        app.state.jobs = [
+            Job(
+                job_id="4990535_12",
+                name="paper-causal-vc",
+                state="RUNNING",
+                partition="nvgpu",
+                nodes="hgnode02",
+                reason="hgnode02",
+                elapsed="1:00",
+                limit="1-00:00:00",
+                node_count="1",
+                cpus="4",
+                gres="N/A",
+                submit_time="2026-08-26T18:45:14",
+                start_time="2026-08-27T08:29:50",
+            )
+        ]
+        screen = FakeScreen(height=32, width=150)
+
+        app._draw_jobs_table(screen, app._visible_jobs(), screen.height, screen.width)
+        app._draw_job_detail(screen, screen.height, screen.width)
+
+        body = {y: text for y, x, text, _ in screen.writes if x == 2 and y >= 27}
+        self.assertEqual(
+            body[28],
+            "paper-causal-vc  job=4990535_12  array-parent=4990535  "
+            "state=RUNNING  partition=nvgpu  nodes=hgnode02",
+        )
+        self.assertEqual(
+            body[29],
+            "submitted=2026-08-26T18:45:14  started=2026-08-27T08:29:50  "
+            "waited-for=13h 44m",
+        )
+        self.assertNotIn("reason=", " ".join(body.values()))
+        self.assertIn((26, 0, "╰", curses.A_DIM), screen.writes)
+        self.assertIn((27, 0, "╭", curses.A_DIM), screen.writes)
+        self.assertIn((31, 0, "╰", curses.A_DIM), screen.writes)
+
+    def test_job_detail_wraps_whole_fields_at_narrow_width(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        app.state.jobs = [make_job("4990535_12")]
+        screen = FakeScreen(height=32, width=70)
+
+        lines = app._job_detail_lines(screen.width)
+
+        self.assertEqual(lines[0], "job  job=4990535_12  array-parent=4990535  state=RUNNING")
+        self.assertEqual(lines[1], "  partition=nvgpu  nodes=h2node01")
+        self.assertNotIn("reason=", " ".join(lines))
+
+    def test_pending_job_detail_keeps_reason(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        app.state.jobs = [make_job("4990535_13", "PENDING", reason="Priority")]
+
+        lines = app._job_detail_lines(120)
+
+        self.assertIn("reason=Priority", " ".join(lines))
+        self.assertIn("waiting-for=", " ".join(lines))
+        self.assertNotIn("waited-for=", " ".join(lines))
+
+    def test_pending_job_waiting_duration_uses_current_time(self):
+        job = make_job(
+            "4990535_13",
+            "PENDING",
+            submit_time="2026-08-27T08:00:00",
+        )
+
+        self.assertEqual(
+            job.waiting_for_text(datetime.datetime(2026, 8, 27, 9, 30)),
+            "1h 30m",
+        )
+
+    def test_node_detail_uses_content_height_without_empty_row(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="nodes")
+        app.state.nodes = [make_node("dev9-ondemand", "(null)")]
+        screen = FakeScreen(height=32, width=150)
+
+        app._draw_nodes_table(screen, app._visible_nodes(), screen.height, screen.width)
+        app._draw_node_detail(screen, screen.height, screen.width)
+
+        self.assertEqual(len(app._node_detail_lines(screen.width)), 5)
+        self.assertEqual(app._node_detail_height(screen.height, screen.width), 7)
+        self.assertIn((24, 0, "╰", curses.A_DIM), screen.writes)
+        self.assertIn((25, 0, "╭", curses.A_DIM), screen.writes)
+        self.assertIn((31, 0, "╰", curses.A_DIM), screen.writes)
 
     def test_box_draws_bottom_right_corner(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
@@ -1772,12 +1874,12 @@ class NodeFilterTests(unittest.TestCase):
         app.state.jobs = [make_job(str(index)) for index in range(60)]
         screen = FakeScreen(height=64)
 
-        self.assertEqual(app._page_size(screen), 48)
+        self.assertEqual(app._page_size(screen), 51)
 
         app.state.selected = 0
         self.assertTrue(app._handle_key(screen, curses.KEY_RIGHT))
-        self.assertEqual(app.state.selected, 48)
-        self.assertEqual(app.state.scroll, 48)
+        self.assertEqual(app.state.selected, 51)
+        self.assertEqual(app.state.scroll, 51)
 
         self.assertTrue(app._handle_key(screen, curses.KEY_LEFT))
         self.assertEqual(app.state.selected, 0)
@@ -1791,20 +1893,20 @@ class NodeFilterTests(unittest.TestCase):
 
     def test_right_arrow_stops_at_partial_last_page_start(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
-        app.state.jobs = [make_job(str(index)) for index in range(101)]
+        app.state.jobs = [make_job(str(index)) for index in range(120)]
         screen = FakeScreen(height=64)
 
-        self.assertEqual(app._page_size(screen), 48)
+        self.assertEqual(app._page_size(screen), 51)
 
-        app.state.selected = 48
-        app.state.scroll = 48
+        app.state.selected = 51
+        app.state.scroll = 51
         self.assertTrue(app._handle_key(screen, curses.KEY_RIGHT))
-        self.assertEqual(app.state.selected, 96)
-        self.assertEqual(app.state.scroll, 96)
+        self.assertEqual(app.state.selected, 102)
+        self.assertEqual(app.state.scroll, 102)
 
         self.assertTrue(app._handle_key(screen, curses.KEY_RIGHT))
-        self.assertEqual(app.state.selected, 96)
-        self.assertEqual(app.state.scroll, 96)
+        self.assertEqual(app.state.selected, 102)
+        self.assertEqual(app.state.scroll, 102)
 
     def test_page_status_uses_selected_item_page(self):
         self.assertEqual(page_status(0, total_items=150, page_size=50), "1/3")

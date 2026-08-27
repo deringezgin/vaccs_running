@@ -43,7 +43,7 @@ class RenderTablesMixin:
         width: int,
     ) -> None:
         table_top = 5
-        detail_height = min(8, max(4, height // 4))
+        detail_height = self._job_detail_height(height, width)
         table_height = max(4, height - detail_height - table_top)
         title = summary_title(
             summarize_jobs(visible),
@@ -287,7 +287,7 @@ class RenderTablesMixin:
         width: int,
     ) -> None:
         table_top = 5
-        detail_height = min(8, max(4, height // 4))
+        detail_height = self._node_detail_height(height, width)
         table_height = max(4, height - detail_height - table_top)
         title = summary_title(
             summarize_nodes(self.state.nodes),
