@@ -184,7 +184,15 @@ SREPORT_USAGE_FORMAT = "Login,Account,TresName,Used"
 SREPORT_USAGE_REPORT = "AccountUtilizationByUser"
 
 
-SSHARE_FAIRSHARE_FORMAT = "User,Account,FairShare,LevelFS"
+SSHARE_FAIRSHARE_FORMAT = (
+    "User,Account,RawShares,RawUsage,FairShare,LevelFS"
+)
+
+
+FAIRSHARE_BILLING_FORMAT = "Login,Account,Used"
+
+
+FAIRSHARE_FORECAST_HORIZONS = (10, 20, 30)
 
 
 USAGE_TRES = "cpu,gres/gpu"

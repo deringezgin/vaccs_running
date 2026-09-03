@@ -29,6 +29,7 @@ from .primitives import (
 )
 from .models import (
     EfficiencySummary,
+    FairshareAssociation,
     GpfsMemberUsage,
     GpfsQuota,
     Job,
@@ -587,12 +588,90 @@ def parse_sshare_scores(
             continue
         user = parts[0].strip()
         account = parts[1].strip()
+        score_index, level_index = (4, 5) if len(parts) >= 6 else (2, 3)
         if user:
-            score = parse_fairshare_value(parts[2])
+            score = parse_fairshare_value(parts[score_index])
             if score is not None:
                 fairshare[(user, account)] = score
         elif account:
-            score = parse_level_fairshare_value(parts[3])
+            score = parse_level_fairshare_value(parts[level_index])
             if score is not None:
                 level_fairshare[account] = score
     return fairshare, level_fairshare
+
+
+def parse_fairshare_associations(output: str) -> list[FairshareAssociation]:
+    """Parse the hierarchy and projection inputs from extended ``sshare`` output."""
+    associations: list[FairshareAssociation] = []
+    account_at_depth: dict[int, str] = {}
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("|")
+        if len(parts) < 6:
+            continue
+        user = parts[0].strip()
+        raw_account = parts[1].rstrip()
+        account = raw_account.strip()
+        if not account:
+            continue
+        try:
+            shares = float(parts[2].strip() or "0")
+            raw_usage = max(0.0, float(parts[3].strip() or "0"))
+        except ValueError:
+            continue
+        if user:
+            parent = account
+        else:
+            depth = len(raw_account) - len(raw_account.lstrip())
+            parent = account_at_depth.get(depth - 1, "") if depth else ""
+            account_at_depth[depth] = account
+            for old_depth in list(account_at_depth):
+                if old_depth > depth:
+                    del account_at_depth[old_depth]
+        associations.append(
+            FairshareAssociation(
+                user=user,
+                account=account,
+                parent=parent,
+                shares=max(0.0, shares),
+                raw_usage=raw_usage,
+                fairshare=(
+                    parse_fairshare_value(parts[4]) if user else None
+                ),
+                level_fairshare=parse_level_fairshare_value(parts[5]),
+            )
+        )
+    return associations
+
+
+def parse_sreport_billing(output: str) -> dict[tuple[str, str], float]:
+    """Billable TRES-seconds by user association; account totals are skipped."""
+    usage: dict[tuple[str, str], float] = {}
+    for line in output.splitlines():
+        parts = line.split("|")
+        if len(parts) < 3:
+            continue
+        user, account = parts[0].strip(), parts[1].strip()
+        if not user or not account:
+            continue
+        try:
+            used = max(0.0, float(parts[2].strip()))
+        except ValueError:
+            continue
+        key = (user, account)
+        usage[key] = usage.get(key, 0.0) + used
+    return usage
+
+
+def parse_slurm_config(output: str) -> dict[str, str]:
+    """Parse the ``name = value`` fields emitted by ``scontrol show config``."""
+    values: dict[str, str] = {}
+    for line in output.splitlines():
+        if "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        name = name.strip()
+        if name:
+            values[name] = value.strip()
+    return values

@@ -5,6 +5,8 @@ from unittest import mock
 
 from vaccs_running.slurm import (
     EfficiencySummary,
+    FairshareForecast,
+    FairshareForecastPoint,
     GpfsMemberUsage,
     GpfsQuota,
     Job,
@@ -92,6 +94,19 @@ class FakeClient:
 
     def fetch_user_fairshare(self):
         return {"pi-test": 0.5}
+
+    def fetch_user_fairshare_forecast(self):
+        return FairshareForecast(
+            account="pi-test",
+            current=0.5,
+            half_life_days=10.5,
+            lookback_days=10.5,
+            points=(
+                FairshareForecastPoint(10, 0.6, 0.5),
+                FairshareForecastPoint(20, 0.7, 0.5),
+                FairshareForecastPoint(30, 0.8, 0.5),
+            ),
+        )
 
     def fetch_user_default_account(self):
         return "pi-test"
@@ -2601,6 +2616,18 @@ class UserInfoTests(unittest.TestCase):
         "status": "ready",
         "default": "pi-smith",
         "fairshare": {"pi-smith": 0.742, "pi-jones": 0.081},
+        "forecast": FairshareForecast(
+            account="pi-smith",
+            current=0.742,
+            half_life_days=10.5,
+            lookback_days=10.5,
+            points=(
+                FairshareForecastPoint(10, 0.8, 0.7),
+                FairshareForecastPoint(20, 0.9, 0.6),
+                FairshareForecastPoint(30, 1.0, 0.5),
+            ),
+        ),
+        "forecast_error": "",
         "accounts_error": "",
         "windows": {
             "24h": (0, 0),
@@ -2658,6 +2685,12 @@ class UserInfoTests(unittest.TestCase):
         self.assertLess(blob.index("pi-smith"), blob.index("pi-jones"))
         self.assertIn("0.742", blob)
         self.assertIn("low priority", blob)
+        self.assertIn("fairshare outlook", blob)
+        self.assertIn("in 10 days", blob)
+        self.assertIn("idle = you run nothing; others repeat", blob)
+        self.assertIn("recent pace = everyone repeats", blob)
+        self.assertIn("10.5d usage half-life", blob)
+        self.assertIn("not a queue-time guarantee", blob)
         # All four windows with EXACT, comma-grouped hour counts (no bars).
         self.assertIn("last 24 hours", blob)
         self.assertIn("last year", blob)
@@ -2732,6 +2765,21 @@ class UserInfoTests(unittest.TestCase):
         self.assertTrue(eff_rows)
         styles = {style for row in eff_rows for _text, style in row}
         self.assertFalse(styles & {"good", "warn", "bad"})
+
+    def test_fairshare_outlook_loads_and_degrades_independently(self):
+        loading = dict(self.READY, forecast=None)
+        loading_blob = "\n".join(
+            _info_text(build_user_info_lines("dgezgin", loading, "/"))
+        )
+        self.assertIn("fairshare outlook", loading_blob)
+        self.assertIn("/ loading", loading_blob)
+
+        failed = dict(self.READY, forecast="error", forecast_error="sreport boom")
+        failed_blob = "\n".join(
+            _info_text(build_user_info_lines("dgezgin", failed))
+        )
+        outlook = failed_blob[failed_blob.index("fairshare outlook"):]
+        self.assertIn("unavailable", outlook)
 
     def test_efficiency_windows_stream_in_independently(self):
         snapshot = {
@@ -2826,6 +2874,7 @@ class UserInfoTests(unittest.TestCase):
         app._info_data = {"status": "loading", "efficiency": {"7d": None}}
 
         app._fetch_info_base(1)  # run the base fetch body synchronously
+        app._fetch_info_forecast(1)
         app._fetch_info_efficiency(1, "7d", "now-7days", "last 7 days")
 
         snapshot = app._info_snapshot()
@@ -2833,6 +2882,7 @@ class UserInfoTests(unittest.TestCase):
         self.assertEqual(snapshot["default"], "pi-test")
         self.assertEqual(snapshot["windows"]["1y"], (10, 2))
         self.assertEqual(snapshot["gpfs"].primary_group, "pi-test")
+        self.assertEqual(snapshot["forecast"].points[0].days, 10)
         self.assertEqual(snapshot["efficiency"]["7d"].job_count, 5)
 
     def test_r_refreshes_info_and_arrow_keys_move_the_offset(self):

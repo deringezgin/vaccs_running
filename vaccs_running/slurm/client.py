@@ -5,11 +5,14 @@ import getpass
 import os
 import shlex
 import subprocess
+import threading
 import time
 from typing import Iterable
 
 from .constants import (
     DEFAULT_SQUEUE_STATES,
+    FAIRSHARE_BILLING_FORMAT,
+    FAIRSHARE_FORECAST_HORIZONS,
     FILTER_CHOICES_FORMAT,
     JOB_EFFICIENCY_FORMAT,
     JOB_EFFICIENCY_WINDOW,
@@ -30,12 +33,14 @@ from .primitives import (
     _user_fairshare,
     history_start,
     normalize_squeue_states,
+    parse_duration_seconds,
     plural_label,
     usage_window_start,
 )
 from .format import format_node_jobs
 from .models import (
     EfficiencySummary,
+    FairshareForecast,
     GpfsMemberUsage,
     GpfsQuota,
     Job,
@@ -47,6 +52,7 @@ from .models import (
     UsageEntry,
 )
 from .parsers import (
+    parse_fairshare_associations,
     parse_gpfs_quota,
     parse_gpfs_group_usage,
     parse_node_job_line,
@@ -56,6 +62,8 @@ from .parsers import (
     parse_scontrol_nodes,
     parse_squeue_line,
     parse_sreport_usage,
+    parse_sreport_billing,
+    parse_slurm_config,
     parse_sprio_line,
     parse_sshare_scores,
     record_from_job,
@@ -72,9 +80,11 @@ from .aggregate import (
     records_for_active_jobs,
     stranded_gpu_count,
 )
+from .fairshare import build_fairshare_forecast
 
 
 PRIORITY_FACTORS_CACHE_SECONDS = 60.0
+FAIRSHARE_CACHE_SECONDS = 5.0
 
 
 class CommandRunner:
@@ -115,6 +125,9 @@ class SlurmClient:
         ] = []
         self._priority_factors_checked_at: float | None = None
         self._priority_factors_error = ""
+        self._fairshare_lock = threading.Lock()
+        self._fairshare_output = ""
+        self._fairshare_checked_at: float | None = None
 
     @property
     def state_filter_active(self) -> bool:
@@ -517,19 +530,111 @@ class SlurmClient:
         self,
     ) -> tuple[dict[tuple[str, str], float], dict[str, float]]:
         """Native user FairShare and account LevelFS from one sshare query."""
-        output = self.runner.run(
-            [
-                "sshare",
-                "-a",
-                "-h",
-                "-P",
-                "-l",
-                "-o",
-                SSHARE_FAIRSHARE_FORMAT,
-            ],
-            timeout=30.0,
+        return parse_sshare_scores(self._fetch_fairshare_output())
+
+    def _fetch_fairshare_output(self) -> str:
+        """Fetch and briefly share one scheduler snapshot across UI workers."""
+        with self._fairshare_lock:
+            now = time.monotonic()
+            if (
+                self._fairshare_checked_at is not None
+                and now - self._fairshare_checked_at < FAIRSHARE_CACHE_SECONDS
+            ):
+                return self._fairshare_output
+            output = self.runner.run(
+                [
+                    "sshare",
+                    "-a",
+                    "-h",
+                    "-P",
+                    "-l",
+                    "-o",
+                    SSHARE_FAIRSHARE_FORMAT,
+                ],
+                timeout=30.0,
+            )
+            self._fairshare_output = output
+            self._fairshare_checked_at = time.monotonic()
+            return output
+
+    def fetch_user_fairshare_forecast(
+        self,
+        now: datetime.datetime | None = None,
+    ) -> FairshareForecast:
+        """Estimate this user's Fair Tree factor if idle or at their recent pace."""
+        associations = parse_fairshare_associations(
+            self._fetch_fairshare_output()
         )
-        return parse_sshare_scores(output)
+        user_accounts = sorted(
+            {
+                association.account
+                for association in associations
+                if association.user == self.user
+            }
+        )
+        if not user_accounts:
+            raise SlurmError("current user fairshare association was not found")
+        if len(user_accounts) == 1:
+            account = user_accounts[0]
+        else:
+            default = self.fetch_user_default_account()
+            account = default if default in user_accounts else user_accounts[0]
+
+        config_output = self.runner.run(
+            ["scontrol", "show", "config"], timeout=30.0
+        )
+        config = parse_slurm_config(config_output)
+        if config.get("PriorityType", "").lower() != "priority/multifactor":
+            raise SlurmError("fairshare forecast requires priority/multifactor")
+        flags = {
+            flag.strip().upper()
+            for flag in config.get("PriorityFlags", "").split(",")
+        }
+        if "NO_FAIR_TREE" in flags:
+            raise SlurmError("fairshare forecast requires Slurm Fair Tree")
+        reset = config.get("PriorityUsageResetPeriod", "NONE").upper()
+        if reset not in {"", "NONE"}:
+            raise SlurmError("fairshare forecast does not support usage resets")
+        half_life_seconds = parse_duration_seconds(
+            config.get("PriorityDecayHalfLife", "")
+        )
+        if half_life_seconds is None or half_life_seconds <= 0.0:
+            raise SlurmError("fairshare decay half-life is unavailable")
+
+        reference = now or datetime.datetime.now()
+        lookback_seconds = half_life_seconds
+        start = (
+            reference - datetime.timedelta(seconds=lookback_seconds)
+        ).strftime("%Y-%m-%dT%H:%M:%S")
+        billing_output = self.runner.run(
+            [
+                "sreport",
+                "-n",
+                "-P",
+                "-t",
+                "Seconds",
+                "cluster",
+                SREPORT_USAGE_REPORT,
+                f"Start={start}",
+                "End=now",
+                "-T",
+                "billing",
+                f"format={FAIRSHARE_BILLING_FORMAT}",
+            ],
+            timeout=180.0,
+        )
+        try:
+            return build_fairshare_forecast(
+                associations=associations,
+                recent_usage=parse_sreport_billing(billing_output),
+                target_user=self.user,
+                target_account=account,
+                half_life_seconds=half_life_seconds,
+                lookback_seconds=lookback_seconds,
+                horizons=FAIRSHARE_FORECAST_HORIZONS,
+            )
+        except ValueError as exc:
+            raise SlurmError(str(exc)) from exc
 
     def fetch_default_accounts(self) -> dict[str, str]:
         """Default Slurm account keyed by user (best effort)."""

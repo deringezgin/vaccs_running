@@ -670,6 +670,47 @@ class UsageEntry:
 
 
 @dataclass(frozen=True)
+class FairshareAssociation:
+    """One account or user association from a long-format ``sshare`` tree."""
+
+    user: str
+    account: str
+    parent: str
+    shares: float
+    raw_usage: float
+    fairshare: float | None = None
+    level_fairshare: float | None = None
+
+    @property
+    def is_user(self) -> bool:
+        return bool(self.user)
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return self.user, self.account
+
+
+@dataclass(frozen=True)
+class FairshareForecastPoint:
+    """Projected Fair Tree factor under two explicit future-use scenarios."""
+
+    days: int
+    idle: float
+    recent_pace: float
+
+
+@dataclass(frozen=True)
+class FairshareForecast:
+    """Calibrated Fair Tree outlook for one user/account association."""
+
+    account: str
+    current: float
+    half_life_days: float
+    lookback_days: float
+    points: tuple[FairshareForecastPoint, ...]
+
+
+@dataclass(frozen=True)
 class LeaderboardRow:
     """A single ranked entry (a user or a group/account) for one window."""
 

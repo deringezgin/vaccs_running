@@ -3,6 +3,8 @@ import unittest
 import datetime
 
 from vaccs_running.slurm import (
+    FAIRSHARE_BILLING_FORMAT,
+    FAIRSHARE_FORECAST_HORIZONS,
     FILTER_CHOICES_FORMAT,
     SACCT_FORMAT,
     NODE_JOBS_FORMAT,
@@ -14,6 +16,7 @@ from vaccs_running.slurm import (
     USAGE_TRES,
     USER_INFO_WINDOWS,
     EfficiencySummary,
+    FairshareAssociation,
     GpfsMemberUsage,
     GpfsQuota,
     JOB_EFFICIENCY_FORMAT,
@@ -35,6 +38,7 @@ from vaccs_running.slurm import (
     VACC_PARTITIONS,
     aggregate_user_usage,
     build_group_leaderboard,
+    build_fairshare_forecast,
     build_priority_queue_snapshot,
     build_user_leaderboard,
     format_fairshare,
@@ -48,6 +52,7 @@ from vaccs_running.slurm import (
     history_start,
     parse_sacct_line,
     parse_fairshare_value,
+    parse_fairshare_associations,
     parse_level_fairshare_value,
     parse_node_job_line,
     parse_priority_queue_line,
@@ -56,6 +61,8 @@ from vaccs_running.slurm import (
     parse_scontrol_nodes,
     parse_scontrol_job_usage,
     parse_sreport_usage,
+    parse_sreport_billing,
+    parse_slurm_config,
     parse_sprio_line,
     parse_sshare_fairshare,
     parse_sshare_scores,
@@ -1955,6 +1962,29 @@ SSHARE_SAMPLE = "\n".join(
 )
 
 
+FAIRSHARE_TREE_SAMPLE = "\n".join(
+    [
+        "|root||300||",
+        "| account-a|1|200||0.750000",
+        "alice|  account-a|1|50|0.666667|2.000000",
+        "target|  account-a|1|150|0.333333|0.666667",
+        "| account-b|1|100||1.500000",
+        "bob|  account-b|1|100|1.000000|1.000000",
+    ]
+)
+
+
+BILLING_SAMPLE = "\n".join(
+    [
+        "|account-a|200",
+        "alice|account-a|50",
+        "target|account-a|150",
+        "|account-b|100",
+        "bob|account-b|100",
+    ]
+)
+
+
 class LeaderboardParsingTests(unittest.TestCase):
     def test_parse_sreport_usage_folds_cpu_and_gpu_per_association(self):
         entries = parse_sreport_usage(SREPORT_SAMPLE)
@@ -1997,6 +2027,94 @@ class LeaderboardParsingTests(unittest.TestCase):
         self.assertEqual(level_fairshare["pi-alwoodwa"], 0.75)
         self.assertEqual(level_fairshare["pi-aelledge"], float("inf"))
         self.assertNotIn("root", level_fairshare)
+
+    def test_parse_extended_sshare_scores_and_hierarchy(self):
+        fairshare, level_fairshare = parse_sshare_scores(FAIRSHARE_TREE_SAMPLE)
+        associations = parse_fairshare_associations(FAIRSHARE_TREE_SAMPLE)
+
+        self.assertEqual(fairshare[("target", "account-a")], 0.333333)
+        self.assertEqual(level_fairshare["account-a"], 0.75)
+        by_key = {association.key: association for association in associations}
+        self.assertEqual(by_key[("", "root")].parent, "")
+        self.assertEqual(by_key[("", "account-a")].parent, "root")
+        self.assertEqual(by_key[("target", "account-a")].parent, "account-a")
+        self.assertEqual(by_key[("target", "account-a")].raw_usage, 150.0)
+
+    def test_parse_billing_skips_account_totals_and_sums_duplicates(self):
+        output = BILLING_SAMPLE + "\ntarget|account-a|25\nbad|line|nope"
+        self.assertEqual(
+            parse_sreport_billing(output),
+            {
+                ("alice", "account-a"): 50.0,
+                ("target", "account-a"): 175.0,
+                ("bob", "account-b"): 100.0,
+            },
+        )
+
+    def test_parse_slurm_config_strips_names_and_values(self):
+        self.assertEqual(
+            parse_slurm_config(
+                "PriorityType = priority/multifactor\n"
+                "PriorityDecayHalfLife   = 10-12:00:00\n"
+            ),
+            {
+                "PriorityType": "priority/multifactor",
+                "PriorityDecayHalfLife": "10-12:00:00",
+            },
+        )
+
+    def test_fairshare_forecast_reproduces_now_and_separates_scenarios(self):
+        forecast = build_fairshare_forecast(
+            associations=parse_fairshare_associations(FAIRSHARE_TREE_SAMPLE),
+            recent_usage=parse_sreport_billing(BILLING_SAMPLE),
+            target_user="target",
+            target_account="account-a",
+            half_life_seconds=10 * 86400,
+            lookback_seconds=10 * 86400,
+            horizons=(10, 20),
+        )
+
+        self.assertEqual(forecast.current, 0.333333)
+        self.assertEqual(forecast.points[0].recent_pace, 1 / 3)
+        self.assertGreater(forecast.points[-1].idle, forecast.current)
+        self.assertEqual(forecast.half_life_days, 10.0)
+
+    def test_equal_decay_without_new_usage_keeps_relative_fairshare(self):
+        forecast = build_fairshare_forecast(
+            associations=parse_fairshare_associations(FAIRSHARE_TREE_SAMPLE),
+            recent_usage={},
+            target_user="target",
+            target_account="account-a",
+            half_life_seconds=10 * 86400,
+            lookback_seconds=10 * 86400,
+            horizons=(10, 20),
+        )
+
+        self.assertTrue(all(point.idle == 1 / 3 for point in forecast.points))
+        self.assertTrue(
+            all(point.recent_pace == 1 / 3 for point in forecast.points)
+        )
+
+    def test_zero_usage_ties_receive_the_same_top_rank(self):
+        associations = [
+            FairshareAssociation("", "root", "", 1, 0),
+            FairshareAssociation("", "a", "root", 1, 0),
+            FairshareAssociation("alice", "a", "a", 1, 0, 1.0),
+            FairshareAssociation("", "b", "root", 1, 0),
+            FairshareAssociation("bob", "b", "b", 1, 0, 1.0),
+        ]
+        forecast = build_fairshare_forecast(
+            associations=associations,
+            recent_usage={},
+            target_user="alice",
+            target_account="a",
+            half_life_seconds=86400,
+            lookback_seconds=86400,
+            horizons=(10,),
+        )
+
+        self.assertEqual(forecast.current, 1.0)
+        self.assertEqual(forecast.points[0].idle, 1.0)
 
     def test_parse_fairshare_value_handles_blanks_and_inf(self):
         self.assertIsNone(parse_fairshare_value(""))
@@ -2258,6 +2376,41 @@ class UserInfoClientTests(unittest.TestCase):
         scores = client.fetch_user_fairshare()
 
         self.assertEqual(scores, {"pi-alwoodwa": 0.812345})
+
+    def test_fetch_user_fairshare_forecast_reuses_snapshot_and_queries_billing(self):
+        client = SlurmClient(user="target")
+        config = "\n".join(
+            [
+                "PriorityType = priority/multifactor",
+                "PriorityFlags = ACCRUE_ALWAYS,CALCULATE_RUNNING",
+                "PriorityDecayHalfLife = 10-00:00:00",
+                "PriorityUsageResetPeriod = NONE",
+            ]
+        )
+        fake_runner = FakeRunner(
+            [FAIRSHARE_TREE_SAMPLE, config, BILLING_SAMPLE]
+        )
+        client.runner = fake_runner
+
+        # The ordinary Info/Usage score and forecast share one short-lived
+        # extended sshare snapshot instead of sending duplicate scheduler RPCs.
+        self.assertIn(("target", "account-a"), client.fetch_fairshare())
+        forecast = client.fetch_user_fairshare_forecast(
+            now=datetime.datetime(2026, 9, 3, 12, 0, 0)
+        )
+
+        self.assertEqual(
+            [call[0][0] for call in fake_runner.calls],
+            ["sshare", "scontrol", "sreport"],
+        )
+        sreport_args = fake_runner.calls[-1][0]
+        self.assertIn("Start=2026-08-24T12:00:00", sreport_args)
+        self.assertIn("billing", sreport_args)
+        self.assertIn(f"format={FAIRSHARE_BILLING_FORMAT}", sreport_args)
+        self.assertEqual(
+            [point.days for point in forecast.points],
+            list(FAIRSHARE_FORECAST_HORIZONS),
+        )
 
     def test_fetch_user_default_account_reads_sacctmgr(self):
         client = SlurmClient(user="jstonge1")

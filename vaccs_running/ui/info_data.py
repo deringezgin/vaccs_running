@@ -15,7 +15,10 @@ class InfoDataMixin:
 
     def _info_loading(self) -> bool:
         with self._info_lock:
-            if self._info_data.get("status") == "loading":
+            status = self._info_data.get("status")
+            if status == "loading":
+                return True
+            if status == "ready" and self._info_data.get("forecast") is None:
                 return True
             efficiency = self._info_data.get("efficiency")
             return isinstance(efficiency, dict) and any(
@@ -39,6 +42,8 @@ class InfoDataMixin:
             self._info_data = {
                 "status": "loading",
                 "fairshare": {},
+                "forecast": None,
+                "forecast_error": "",
                 "default": "",
                 "accounts_error": "",
                 "windows": {},
@@ -51,6 +56,9 @@ class InfoDataMixin:
             }
         threading.Thread(
             target=self._fetch_info_base, args=(generation,), daemon=True
+        ).start()
+        threading.Thread(
+            target=self._fetch_info_forecast, args=(generation,), daemon=True
         ).start()
         for key, window, label in JOB_EFFICIENCY_WINDOWS:
             threading.Thread(
@@ -98,6 +106,18 @@ class InfoDataMixin:
             if generation == self._info_generation:
                 self._info_data.update(update)
                 self._info_data["status"] = "ready"
+
+    def _fetch_info_forecast(self, generation: int) -> None:
+        try:
+            forecast: object = self.client.fetch_user_fairshare_forecast()
+            error = ""
+        except Exception as exc:
+            forecast = "error"
+            error = str(exc)
+        with self._info_lock:
+            if generation == self._info_generation:
+                self._info_data["forecast"] = forecast
+                self._info_data["forecast_error"] = error
 
     def _fetch_info_efficiency(
         self,

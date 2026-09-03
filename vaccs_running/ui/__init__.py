@@ -134,9 +134,9 @@ class VaccsRunningApp(
         self._lb_level_fairshare: dict[str, float] = {}
         self._lb_default_accounts: dict[str, str] = {}
 
-        # The Info tab loads its user card (accounts, fairshare, per-window
-        # compute usage, GPFS quota) in a single background thread so switching
-        # to the tab never blocks. Manual refresh only (press 'r').
+        # The Info tab loads its user card, Fair Tree outlook, and efficiency
+        # windows in background workers so switching to the tab never blocks.
+        # Manual refresh only (press 'r').
         self._info_lock = threading.Lock()
         self._info_generation = 0
         self._info_started = False

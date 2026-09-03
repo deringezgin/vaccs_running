@@ -204,6 +204,11 @@ A one-screen card for **your** account on the cluster:
 - **Account** — your username and primary PI group
 - **Fairshare** — your current Slurm fairshare score per account, labelled
   high / normal / low priority
+- **Fairshare outlook** — estimated scores 10, 20, and 30 days ahead under two
+  explicit scenarios: you run nothing, or everyone (including you) continues
+  at their recent billable-usage pace. The model uses VACC's live Fair Tree
+  hierarchy and decay half-life; these are conditional estimates, not queue-time
+  guarantees
 - **Compute usage** — exact CPU-hours and GPU-hours over the **last 24 hours, 7
   days, 30 days, and 1 year** (per-user `sreport`, so even the year window is
   fast)

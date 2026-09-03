@@ -78,6 +78,9 @@ def build_user_info_lines(
             )
     blank()
 
+    rows.extend(_fairshare_forecast_lines(snapshot, spinner))
+    blank()
+
     # Compute usage (exact hours, no bars) ------------------------------
     rows.append([("compute usage", "heading")])
     rows.append(
@@ -115,6 +118,79 @@ def build_user_info_lines(
 
     # Job efficiency (last; each window streams in as it loads) ---------
     rows.extend(_efficiency_lines(snapshot, spinner))
+    return rows
+
+
+def _fairshare_forecast_lines(
+    snapshot: dict,
+    spinner: str,
+) -> list[list[tuple[str, str]]]:
+    """Render an explicitly conditional Fair Tree outlook."""
+    forecast = snapshot.get("forecast")
+    account = getattr(forecast, "account", "") or snapshot.get("default", "")
+    suffix = f"  {account} estimate" if account else "  estimate"
+    rows: list[list[tuple[str, str]]] = [
+        [("fairshare outlook", "heading"), (suffix, "muted")]
+    ]
+    if forecast is None:
+        rows.append([("  ", "muted"), (f"{spinner} loading".strip(), "muted")])
+        return rows
+    if forecast == "error":
+        rows.append([("  ", "muted"), ("unavailable", "bad")])
+        return rows
+
+    rows.append(
+        [
+            ("  ", "muted"),
+            (f"{'':<13}", "muted"),
+            (f"{'idle':>9}", "muted"),
+            ("   ", "muted"),
+            (f"{'recent pace':>11}", "muted"),
+        ]
+    )
+    current = forecast.current
+    current_style, _label = fairshare_style(current)
+    rows.append(
+        [
+            ("  ", "muted"),
+            (f"{'now':<13}", "muted"),
+            (f"{format_fairshare(current):>9}", current_style),
+            ("   ", "muted"),
+            (f"{format_fairshare(current):>11}", current_style),
+        ]
+    )
+    for point in forecast.points:
+        idle_style, _label = fairshare_style(point.idle)
+        pace_style, _label = fairshare_style(point.recent_pace)
+        rows.append(
+            [
+                ("  ", "muted"),
+                (f"{f'in {point.days} days':<13}", "muted"),
+                (f"{format_fairshare(point.idle):>9}", idle_style),
+                ("   ", "muted"),
+                (f"{format_fairshare(point.recent_pace):>11}", pace_style),
+            ]
+        )
+    lookback = f"{forecast.lookback_days:g}"
+    half_life = f"{forecast.half_life_days:g}"
+    rows.append(
+        [
+            ("  idle = you run nothing; others repeat ", "muted"),
+            (f"the last {lookback}d", "muted"),
+        ]
+    )
+    rows.append(
+        [
+            ("  recent pace = everyone repeats ", "muted"),
+            (f"the last {lookback}d", "muted"),
+        ]
+    )
+    rows.append(
+        [
+            (f"  Fair Tree rank model; {half_life}d usage half-life; ", "muted"),
+            ("not a queue-time guarantee", "muted"),
+        ]
+    )
     return rows
 
 

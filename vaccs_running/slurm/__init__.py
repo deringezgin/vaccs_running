@@ -6,6 +6,7 @@ from .format import *  # noqa: F401,F403
 from .models import *  # noqa: F401,F403
 from .parsers import *  # noqa: F401,F403
 from .aggregate import *  # noqa: F401,F403
+from .fairshare import *  # noqa: F401,F403
 from .client import *  # noqa: F401,F403
 
 __all__ = [
@@ -13,6 +14,11 @@ __all__ = [
     "DEFAULT_SQUEUE_STATES",
     "EfficiencySummary",
     "FAILED_STATES",
+    "FAIRSHARE_BILLING_FORMAT",
+    "FAIRSHARE_FORECAST_HORIZONS",
+    "FairshareAssociation",
+    "FairshareForecast",
+    "FairshareForecastPoint",
     "FILTER_CHOICES_FORMAT",
     "GPU_TRES_NAMES",
     "GpfsMemberUsage",
@@ -69,6 +75,7 @@ __all__ = [
     "attach_priority_tres",
     "append_job_usage",
     "build_group_leaderboard",
+    "build_fairshare_forecast",
     "build_user_leaderboard",
     "build_priority_queue_snapshot",
     "dominant_account",
@@ -95,6 +102,7 @@ __all__ = [
     "parse_duration_seconds",
     "parse_elapsed_seconds",
     "parse_fairshare_value",
+    "parse_fairshare_associations",
     "parse_float",
     "parse_gpfs_quota",
     "parse_gpfs_group_usage",
@@ -115,6 +123,8 @@ __all__ = [
     "parse_scontrol_nodes",
     "parse_squeue_line",
     "parse_sreport_usage",
+    "parse_sreport_billing",
+    "parse_slurm_config",
     "parse_sprio_line",
     "parse_sshare_fairshare",
     "parse_sshare_scores",
