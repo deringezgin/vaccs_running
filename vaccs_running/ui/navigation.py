@@ -10,6 +10,7 @@ from ..slurm import (
     Node,
     PriorityQueueEntry,
     group_job_records,
+    parse_elapsed_seconds,
     record_from_job,
 )
 
@@ -23,6 +24,62 @@ def _job_id_sort_key(job_id: str) -> tuple:
 
 
 class NavigationMixin:
+    def _sort_jobs(self, jobs: list[Job]) -> list[Job]:
+        ordered = sorted(jobs, key=lambda job: _job_id_sort_key(job.job_id))
+        if self.state.jobs_sort == "state":
+            return sorted(
+                ordered,
+                key=lambda job: job.state.upper(),
+                reverse=not self.state.jobs_ascending,
+            )
+        if self.state.jobs_sort == "elapsed":
+            known = [job for job in ordered if parse_elapsed_seconds(job.elapsed) >= 0]
+            unknown = [job for job in ordered if parse_elapsed_seconds(job.elapsed) < 0]
+            return sorted(
+                known,
+                key=lambda job: parse_elapsed_seconds(job.elapsed),
+                reverse=not self.state.jobs_ascending,
+            ) + unknown
+        if not self.state.jobs_ascending:
+            ordered.reverse()
+        return ordered
+
+    def _sort_job_groups(
+        self,
+        groups: list[JobRecordGroup],
+    ) -> list[JobRecordGroup]:
+        ordered = sorted(
+            groups,
+            key=lambda group: _job_id_sort_key(group.array_parent),
+        )
+        if self.state.jobs_sort == "state":
+            return sorted(
+                ordered,
+                key=lambda group: group.dominant_state,
+                reverse=not self.state.jobs_ascending,
+            )
+        if self.state.jobs_sort == "elapsed":
+            known = [
+                group
+                for group in ordered
+                if parse_elapsed_seconds(group.longest_running_elapsed) >= 0
+            ]
+            unknown = [
+                group
+                for group in ordered
+                if parse_elapsed_seconds(group.longest_running_elapsed) < 0
+            ]
+            return sorted(
+                known,
+                key=lambda group: parse_elapsed_seconds(
+                    group.longest_running_elapsed
+                ),
+                reverse=not self.state.jobs_ascending,
+            ) + unknown
+        if not self.state.jobs_ascending:
+            ordered.reverse()
+        return ordered
+
     def _filter_priority_entries(
         self,
         entries: tuple[PriorityQueueEntry, ...] | list[PriorityQueueEntry],
@@ -58,7 +115,7 @@ class NavigationMixin:
         else:
             visible = filter_running_jobs(self.state.jobs)
 
-        return sorted(visible, key=lambda job: _job_id_sort_key(job.job_id))
+        return self._sort_jobs(list(visible))
 
     def _visible_job_groups(self) -> list[JobRecordGroup]:
         if self._jobs_filter_active() and not self.state.job_records:
@@ -67,10 +124,7 @@ class NavigationMixin:
             )
         else:
             groups = group_job_records(self.state.job_records)
-        return sorted(
-            groups,
-            key=lambda group: _job_id_sort_key(group.array_parent),
-        )
+        return self._sort_job_groups(groups)
 
     def _visible_history_groups(self) -> list[JobRecordGroup]:
         return group_job_records(self.state.history)

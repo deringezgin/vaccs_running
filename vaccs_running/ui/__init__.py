@@ -63,6 +63,8 @@ class AppState:
     gpu_nodes_only: bool = False
     free_gpu_only: bool = False
     jobs_grouped: bool = False
+    jobs_sort: str = "job_id"
+    jobs_ascending: bool = True
     history_window: str = "24h"
     leaderboard_group_mode: bool = False
     leaderboard_sort: str = "gpu"

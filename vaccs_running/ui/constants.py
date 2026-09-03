@@ -66,6 +66,19 @@ LEADERBOARD_SORT_DISPLAY = ["gpu", "cpu", "fairshare"]
 LEADERBOARD_SORT_SHORT = {"cpu": "CPU", "gpu": "GPU", "fairshare": "fairshare"}
 
 
+JOB_SORT_OPTIONS = [
+    ("job_id", "job-id"),
+    ("state", "state"),
+    ("elapsed", "elapsed"),
+]
+
+
+JOB_SORTS = [key for key, _label in JOB_SORT_OPTIONS]
+
+
+JOB_SORT_LABELS = dict(JOB_SORT_OPTIONS)
+
+
 HISTORY_REFRESH_SECONDS = 10.0
 
 

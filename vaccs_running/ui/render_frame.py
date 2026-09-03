@@ -7,6 +7,7 @@ from .constants import (
     ACTIVE_TAB_PAIR,
     HISTORY_FILTER_OPTIONS,
     INFO_TOP,
+    JOB_SORT_OPTIONS,
     LEADERBOARD_SORT_DISPLAY,
     LEADERBOARD_SORT_SHORT,
     MIN_TERMINAL_HEIGHT,
@@ -276,6 +277,8 @@ class RenderFrameMixin:
                 self._pair(ACTIVE_TAB_PAIR if self._jobs_filter_active() else MUTED_PAIR),
             )
             x += len(filter_text) + 1
+            self._addstr(stdscr, 3, x, " d detail ", self._pair(MUTED_PAIR))
+            x += len(" d detail ") + 1
             if self._squeue_state_filter_active():
                 state_text = f" state: {job_state_filter_label(self._squeue_state_filter())} "
                 self._addstr(stdscr, 3, x, state_text, self._pair(ACTIVE_TAB_PAIR))
@@ -295,8 +298,21 @@ class RenderFrameMixin:
                 partition_text = f" partition: {self._job_partition_summary()} "
                 self._addstr(stdscr, 3, x, partition_text, self._pair(ACTIVE_TAB_PAIR))
                 x += len(partition_text) + 1
-            self._addstr(stdscr, 3, x, " d detail ", self._pair(MUTED_PAIR))
-            x += len(" d detail ") + 1
+            x = self._draw_header_choice(
+                stdscr,
+                x,
+                " s sort: ",
+                JOB_SORT_OPTIONS,
+                self.state.jobs_sort,
+            )
+            order = "ascending" if self.state.jobs_ascending else "descending"
+            x = self._draw_header_choice(
+                stdscr,
+                x,
+                " o order: ",
+                [("ascending", "ascending"), ("descending", "descending")],
+                order,
+            )
 
         # Every view carries a right-aligned quit hint on the controls row.
         quit_label = "q quit"
@@ -307,7 +323,6 @@ class RenderFrameMixin:
             quit_label,
             self._pair(MUTED_PAIR),
         )
-
     def _draw_header_choice(
         self,
         stdscr: curses.window,

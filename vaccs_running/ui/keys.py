@@ -5,6 +5,8 @@ import curses
 from .curses_compat import safe_getmouse
 from .constants import (
     HISTORY_FILTER_OPTIONS,
+    JOB_SORT_LABELS,
+    JOB_SORTS,
     LEADERBOARD_PAGE,
     TOP_TABS,
 )
@@ -102,7 +104,16 @@ class KeyHandlingMixin:
                 self._show_job_efficiency(stdscr)
             elif self.state.view == "priority":
                 self._toggle_priority_extended()
-
+        elif key == ord("s"):
+            if self.state.view == "jobs":
+                self._cycle_jobs_sort()
+        elif key == ord("o"):
+            if self.state.view == "jobs":
+                self.state.jobs_ascending = not self.state.jobs_ascending
+                self.state.selected = 0
+                self.state.scroll = 0
+                order = "ascending" if self.state.jobs_ascending else "descending"
+                self.state.message = f"jobs order: {order}"
         self._clamp_selection()
         return True
 
@@ -306,6 +317,17 @@ class KeyHandlingMixin:
             self.state.leaderboard_sort, self.state.leaderboard_sort
         )
         self.state.message = f"usage sorted by {label}"
+
+    def _cycle_jobs_sort(self) -> None:
+        try:
+            index = JOB_SORTS.index(self.state.jobs_sort)
+        except ValueError:
+            index = -1
+        self.state.jobs_sort = JOB_SORTS[(index + 1) % len(JOB_SORTS)]
+        self.state.selected = 0
+        self.state.scroll = 0
+        label = JOB_SORT_LABELS.get(self.state.jobs_sort, self.state.jobs_sort)
+        self.state.message = f"jobs sorted by {label}"
 
     def _set_history_window(self, window: str) -> None:
         if window not in HISTORY_WINDOWS:

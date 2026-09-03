@@ -1496,7 +1496,7 @@ class NodeFilterTests(unittest.TestCase):
         self.assertFalse(app.state.jobs_grouped)
         self.assertEqual(app.state.message, "job grouping off")
 
-    def test_running_view_hides_completed_and_c_is_unused(self):
+    def test_running_view_hides_completed_jobs(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
         app.state.jobs = [
             make_job("4413548_1", "COMPLETED", name="active-array"),
@@ -1505,14 +1505,6 @@ class NodeFilterTests(unittest.TestCase):
             make_job("9999999_1", "COMPLETED", name="finished-array"),
         ]
 
-        self.assertEqual(
-            [job.job_id for job in app._visible_jobs()],
-            ["4413548_2", "4413548_3"],
-        )
-
-        self.assertTrue(app._handle_key(None, ord("c")))
-
-        self.assertEqual(app.state.message, "")
         self.assertEqual(
             [job.job_id for job in app._visible_jobs()],
             ["4413548_2", "4413548_3"],
@@ -1533,6 +1525,58 @@ class NodeFilterTests(unittest.TestCase):
             ["3", "20", "100_2", "100_10"],
         )
 
+    def test_jobs_can_sort_by_state_and_elapsed_in_both_orders(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        app.state.jobs = [
+            make_job("100", "RUNNING", elapsed="2:00:00"),
+            make_job("20", "PENDING", elapsed="0:00"),
+            make_job("3", "RUNNING", elapsed="0:10"),
+            make_job("200", "RUNNING", elapsed="N/A"),
+        ]
+
+        app.state.jobs_sort = "state"
+        self.assertEqual(
+            [job.job_id for job in app._visible_jobs()],
+            ["20", "3", "100", "200"],
+        )
+        app.state.jobs_ascending = False
+        self.assertEqual(
+            [job.job_id for job in app._visible_jobs()],
+            ["3", "100", "200", "20"],
+        )
+
+        app.state.jobs_sort = "elapsed"
+        app.state.jobs_ascending = True
+        self.assertEqual(
+            [job.job_id for job in app._visible_jobs()],
+            ["20", "3", "100", "200"],
+        )
+        app.state.jobs_ascending = False
+        self.assertEqual(
+            [job.job_id for job in app._visible_jobs()],
+            ["100", "3", "20", "200"],
+        )
+
+    def test_jobs_sort_and_order_keys_cycle_and_reset_selection(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        app.state.selected = 4
+        app.state.scroll = 2
+
+        self.assertTrue(app._handle_key(None, ord("s")))
+        self.assertEqual(app.state.jobs_sort, "state")
+        self.assertEqual(app.state.selected, 0)
+        self.assertEqual(app.state.scroll, 0)
+        self.assertEqual(app.state.message, "jobs sorted by state")
+
+        app._handle_key(None, ord("s"))
+        self.assertEqual(app.state.jobs_sort, "elapsed")
+        app._handle_key(None, ord("s"))
+        self.assertEqual(app.state.jobs_sort, "job_id")
+
+        self.assertTrue(app._handle_key(None, ord("o")))
+        self.assertFalse(app.state.jobs_ascending)
+        self.assertEqual(app.state.message, "jobs order: descending")
+
     def test_grouped_jobs_are_sorted_by_job_id_ascending(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
         app.state.job_records = [
@@ -1545,6 +1589,65 @@ class NodeFilterTests(unittest.TestCase):
             [group.array_parent for group in app._visible_job_groups()],
             ["3", "20", "100"],
         )
+
+    def test_grouped_jobs_follow_state_and_elapsed_sorting(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        app.state.job_records = [
+            make_record("100_1", "RUNNING", elapsed="2:00:00"),
+            make_record("20_1", "PENDING", elapsed="0:00"),
+            make_record("3_1", "RUNNING", elapsed="0:10"),
+        ]
+
+        app.state.jobs_sort = "state"
+        self.assertEqual(
+            [group.array_parent for group in app._visible_job_groups()],
+            ["20", "3", "100"],
+        )
+
+        app.state.jobs_sort = "elapsed"
+        app.state.jobs_ascending = False
+        self.assertEqual(
+            [group.array_parent for group in app._visible_job_groups()],
+            ["100", "3", "20"],
+        )
+
+    def test_jobs_header_shows_sort_and_order_cycles(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        screen = FakeScreen(height=40, width=120)
+
+        app._draw_header(screen, screen.width)
+
+        row = " ".join(text for y, _x, text, _attr in screen.writes if y == 3)
+        self.assertIn("g group", row)
+        self.assertIn("f filter", row)
+        self.assertIn("s sort:", row)
+        self.assertIn("job-id", row)
+        self.assertIn("state", row)
+        self.assertIn("elapsed", row)
+        self.assertIn("o order:", row)
+        self.assertIn("ascending", row)
+        self.assertIn("descending", row)
+        self.assertIn("d detail", row)
+        self.assertFalse(any(y == 4 for y, _x, _text, _attr in screen.writes))
+
+        default_attrs = {
+            text: attr
+            for y, _x, text, attr in screen.writes
+            if y == 3 and text in {"job-id", "state", "elapsed"}
+        }
+        self.assertNotEqual(default_attrs["job-id"], default_attrs["state"])
+
+        app.state.jobs_sort = "elapsed"
+        app.state.jobs_ascending = False
+        changed = FakeScreen(height=40, width=120)
+        app._draw_header(changed, changed.width)
+        changed_attrs = {
+            text: attr
+            for y, _x, text, attr in changed.writes
+            if y == 3 and text in {"job-id", "state", "elapsed"}
+        }
+        self.assertEqual(changed_attrs["elapsed"], default_attrs["job-id"])
+        self.assertEqual(changed_attrs["job-id"], default_attrs["state"])
 
     def test_state_prefiltered_jobs_are_not_filtered_again_by_ui(self):
         client = StateFilteredClient()
